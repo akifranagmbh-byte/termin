@@ -1,0 +1,177 @@
+name: Verify emergency order link from live storefront
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-emergency-menu-live.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-live-menu-and-checkout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Open the public homepage, use the emergency menu link and reach Shopify checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/kfz-menu-live-test
+          mkdir -p "$OUT"
+          cd "$OUT"
+          npm init -y >/dev/null 2>&1
+          npm install puppeteer-core@24.16.0 --no-audit --no-fund >/dev/null
+
+          cat > test.js <<'NODE'
+          const fs = require('fs');
+          const puppeteer = require('puppeteer-core');
+
+          const STORE = 'https://kennzeichen-krefeld.com';
+          const ORDER_PAGE = '/pages/zulassung-jetzt-bestellen';
+          const VARIANT = '51237294539018';
+          const candidates = [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+          ];
+          const executablePath = candidates.find((p) => fs.existsSync(p));
+          if (!executablePath) throw new Error('Chrome/Chromium not found');
+
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const isCheckout = (url) => /\/checkouts?\//.test(url) || url.includes('/checkout');
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath,
+              headless: false,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--window-size=1440,1100',
+              ],
+            });
+            const context = await browser.createBrowserContext();
+            const page = await context.newPage();
+            await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
+            await page.setExtraHTTPHeaders({
+              'Cache-Control': 'no-cache, no-store, max-age=0',
+              Pragma: 'no-cache',
+            });
+
+            try {
+              const response = await page.goto(`${STORE}/?menu-live-test=${Date.now()}`, {
+                waitUntil: 'networkidle2',
+                timeout: 90000,
+              });
+              if (!response || !response.ok()) {
+                throw new Error(`Homepage failed: ${response ? response.status() : 'no response'}`);
+              }
+
+              const menuSelector = `a[href="${ORDER_PAGE}"]`;
+              await page.waitForSelector(menuSelector, { visible: true, timeout: 45000 });
+              const menuState = await page.evaluate((selector) => {
+                const links = Array.from(document.querySelectorAll(selector));
+                const visible = links.find((link) => {
+                  const style = getComputedStyle(link);
+                  const rect = link.getBoundingClientRect();
+                  return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                });
+                return {
+                  title: document.title,
+                  linkCount: links.length,
+                  visibleText: visible?.textContent?.trim() || '',
+                  visibleHref: visible?.getAttribute('href') || '',
+                };
+              }, menuSelector);
+              console.log(`[homepage-menu] ${JSON.stringify(menuState)}`);
+              fs.writeFileSync('homepage-menu.json', JSON.stringify(menuState, null, 2));
+              await page.screenshot({ path: 'homepage-menu.png', fullPage: false });
+
+              if (!/JETZT ZULASSUNG BESTELLEN/i.test(menuState.visibleText)) {
+                throw new Error(`Emergency menu link is not visibly active: ${JSON.stringify(menuState)}`);
+              }
+
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+                page.click(menuSelector),
+              ]);
+              await sleep(900);
+
+              const orderPageState = await page.evaluate(() => ({
+                url: location.href,
+                heading: document.querySelector('h1')?.textContent?.trim() || '',
+                text: document.body.innerText.slice(0, 3000),
+              }));
+              console.log(`[order-page] ${JSON.stringify(orderPageState)}`);
+              fs.writeFileSync('order-page.json', JSON.stringify(orderPageState, null, 2));
+              await page.screenshot({ path: 'order-page.png', fullPage: true });
+
+              if (!/Kfz-Zulassung jetzt bestellen/i.test(orderPageState.heading)) {
+                throw new Error(`Wrong order page: ${JSON.stringify(orderPageState)}`);
+              }
+
+              const orderSelector = `a[href*="/cart/${VARIANT}:1"]`;
+              await page.waitForSelector(orderSelector, { visible: true, timeout: 30000 });
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+                page.click(orderSelector),
+              ]);
+              await sleep(1200);
+
+              const checkoutState = await page.evaluate(() => ({
+                url: location.href,
+                title: document.title,
+                text: document.body.innerText.slice(0, 9000),
+              }));
+              console.log(`[checkout] ${JSON.stringify({ url: checkoutState.url, title: checkoutState.title })}`);
+              fs.writeFileSync('checkout.json', JSON.stringify(checkoutState, null, 2));
+              await page.screenshot({ path: 'checkout.png', fullPage: false });
+
+              if (!isCheckout(checkoutState.url)) {
+                throw new Error(`Checkout not reached: ${checkoutState.url}`);
+              }
+              if (!/KFZ Anmeldung|Neuzulassung/i.test(checkoutState.text)) {
+                throw new Error('Expected Zulassung product not visible in checkout');
+              }
+              if (!/120[,.]00|120\s*€/i.test(checkoutState.text)) {
+                throw new Error('Expected 120 EUR price not visible in checkout');
+              }
+
+              const result = {
+                passed: true,
+                homepage: STORE,
+                menuText: menuState.visibleText,
+                orderPage: orderPageState.url,
+                checkoutUrl: checkoutState.url,
+                product: 'KFZ Anmeldung / Neuzulassung',
+                price: '120,00 EUR',
+                orderCompleted: false,
+                paymentSubmitted: false,
+              };
+              fs.writeFileSync('result.json', JSON.stringify(result, null, 2));
+              console.log(`[success] ${JSON.stringify(result)}`);
+            } finally {
+              await browser.close();
+            }
+          })().catch((error) => {
+            console.error(error.stack || error.message);
+            process.exit(1);
+          });
+          NODE
+
+          xvfb-run -a node test.js | tee test.log
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emergency-menu-live-test
+          path: /tmp/kfz-menu-live-test
+          if-no-files-found: error
+          retention-days: 1
