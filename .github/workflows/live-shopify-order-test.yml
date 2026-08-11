@@ -1,4 +1,4 @@
-name: Live Shopify order flow test — current run
+name: Live Shopify order flow test — stable verification
 
 on:
   pull_request:
@@ -12,25 +12,40 @@ permissions:
 jobs:
   live-order-flow:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
-      - name: Verify published theme and rendered order form
+      - name: Verify published theme and rendered order form without stale CDN cache
         shell: bash
         run: |
           set -euo pipefail
           STORE='https://kennzeichen-krefeld.com'
-          LIVE_URL="${STORE}/?live-order-test=20260811"
+          success='false'
 
-          curl --max-time 60 --connect-timeout 15 -L -sS \
-            -D /tmp/live-headers.txt \
-            -o /tmp/live-static.html \
-            "$LIVE_URL"
+          for attempt in 1 2 3 4 5 6; do
+            stamp="$(date +%s%N)-${attempt}"
+            LIVE_URL="${STORE}/?live-order-test=${stamp}"
+            echo "theme_attempt=${attempt} url=${LIVE_URL}"
 
-          echo '=== PUBLISHED THEME ==='
-          grep -Eo 'Shopify\.theme = \{[^;]+' /tmp/live-static.html | head -1
-          grep -q '"id":192981696778' /tmp/live-static.html
-          grep -q '"role":"main"' /tmp/live-static.html
-          grep -q 'kfz-order-fix.js' /tmp/live-static.html
+            curl --max-time 60 --connect-timeout 15 --retry 3 --retry-all-errors --retry-delay 2 -L -sS \
+              -H 'Cache-Control: no-cache, no-store, max-age=0' \
+              -H 'Pragma: no-cache' \
+              -D /tmp/live-headers.txt \
+              -o /tmp/live-static.html \
+              "$LIVE_URL"
+
+            theme_marker=$(grep -Eo 'Shopify\.theme = \{[^;]+' /tmp/live-static.html | head -1 || true)
+            echo "$theme_marker"
+
+            if grep -q '"id":192981696778' /tmp/live-static.html \
+              && grep -q '"role":"main"' /tmp/live-static.html \
+              && grep -q 'kfz-order-fix.js' /tmp/live-static.html; then
+              success='true'
+              break
+            fi
+            sleep 3
+          done
+
+          test "$success" = 'true'
 
           BROWSER=''
           for candidate in google-chrome-stable google-chrome chromium chromium-browser; do
@@ -41,14 +56,17 @@ jobs:
           done
           test -n "$BROWSER"
 
+          BROWSER_URL="${STORE}/?live-browser-test=$(date +%s%N)"
           "$BROWSER" \
             --headless=new \
             --no-sandbox \
             --disable-gpu \
             --disable-dev-shm-usage \
-            --virtual-time-budget=15000 \
+            --disk-cache-size=1 \
+            --media-cache-size=1 \
+            --virtual-time-budget=18000 \
             --dump-dom \
-            "$LIVE_URL" > /tmp/live-rendered.html
+            "$BROWSER_URL" > /tmp/live-rendered.html
 
           echo '=== RENDERED REPAIR FORM ==='
           grep -n 'id="kfz-fixed-order-form"' /tmp/live-rendered.html | head -1
@@ -65,6 +83,33 @@ jobs:
           set -euo pipefail
           STORE='https://kennzeichen-krefeld.com'
           VERSION='2026-08-11.3-LIVE-TEST'
+
+          read_cart_with_retry() {
+            cookie="$1"
+            output="$2"
+            for attempt in 1 2 3 4 5 6; do
+              curl --max-time 45 --connect-timeout 15 --retry 2 --retry-all-errors --retry-delay 1 -sS \
+                -c "$cookie" -b "$cookie" \
+                -H 'Accept: application/json' \
+                -H 'Cache-Control: no-cache, no-store, max-age=0' \
+                "${STORE}/cart.js?live_test=$(date +%s%N)" > "$output" || true
+              if python3 - "$output" <<'PY'
+          import json, sys
+          try:
+              data = json.load(open(sys.argv[1], encoding='utf-8'))
+              assert isinstance(data, dict)
+              assert 'item_count' in data
+          except Exception:
+              raise SystemExit(1)
+          PY
+              then
+                return 0
+              fi
+              echo "cart_read_retry=${attempt}"
+              sleep 2
+            done
+            return 1
+          }
 
           test_service() {
             service="$1"
@@ -97,7 +142,7 @@ jobs:
           PY
             )
 
-            add_code=$(curl --max-time 45 --connect-timeout 15 -sS \
+            add_code=$(curl --max-time 45 --connect-timeout 15 --retry 3 --retry-all-errors --retry-delay 2 -sS \
               -c "$cookie" -b "$cookie" \
               -o "$add_body" -w '%{http_code}' \
               -X POST "${STORE}/cart/add.js" \
@@ -107,9 +152,7 @@ jobs:
             echo "${service}: cart_add_http=${add_code}"
             test "$add_code" = '200'
 
-            curl --max-time 45 --connect-timeout 15 -sS \
-              -c "$cookie" -b "$cookie" \
-              "${STORE}/cart.js" > "$cart_body"
+            read_cart_with_retry "$cookie" "$cart_body"
 
             python3 - "$cart_body" "$variant" "$expected_service" "$expected_price" "$VERSION" <<'PY'
           import json, sys
@@ -125,23 +168,24 @@ jobs:
           print('verified:', item['title'], item['final_line_price'], item['properties'])
           PY
 
-            checkout_result=$(curl --max-time 60 --connect-timeout 15 -L -sS \
+            checkout_result=$(curl --max-time 60 --connect-timeout 15 --retry 3 --retry-all-errors --retry-delay 2 -L -sS \
               -c "$cookie" -b "$cookie" \
               -D "$checkout_headers" \
               -o "$checkout_body" \
               -w '%{http_code} %{url_effective}' \
-              "${STORE}/checkout")
+              "${STORE}/checkout?live_test=$(date +%s%N)")
             echo "${service}: checkout=${checkout_result}"
             checkout_code=${checkout_result%% *}
             checkout_url=${checkout_result#* }
             test "$checkout_code" = '200'
             echo "$checkout_url" | grep -Eq '/checkout|/checkouts/'
 
-            clear_code=$(curl --max-time 45 --connect-timeout 15 -sS \
+            clear_code=$(curl --max-time 45 --connect-timeout 15 --retry 3 --retry-all-errors --retry-delay 2 -sS \
               -c "$cookie" -b "$cookie" \
               -o "$clear_body" -w '%{http_code}' \
               -X POST "${STORE}/cart/clear.js" \
               -H 'Accept: application/json')
+            echo "${service}: cart_clear_http=${clear_code}"
             test "$clear_code" = '200'
             grep -Eq '"item_count"[[:space:]]*:[[:space:]]*0' "$clear_body"
           }
