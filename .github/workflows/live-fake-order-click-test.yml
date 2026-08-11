@@ -1,0 +1,394 @@
+name: Live fake-data order button test
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/live-fake-order-click-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-form-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fill the live forms with clearly fictitious data and click submit
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/live-fake-order-test
+          mkdir -p "$OUT"
+          cd "$OUT"
+
+          npm init -y >/dev/null 2>&1
+          npm install puppeteer-core@24.16.0 --no-audit --no-fund >/dev/null
+          python3 -m pip install --quiet pillow
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image, ImageDraw
+
+          out = Path('/tmp/live-fake-order-test')
+          labels = {
+              'teil1-vorne-test.png': 'TEST – TEIL I VORNE\nKEIN ECHTES DOKUMENT',
+              'teil1-hinten-test.png': 'TEST – TEIL I HINTEN\nKEIN ECHTES DOKUMENT',
+              'teil2-test.png': 'TEST – TEIL II\nKEIN ECHTES DOKUMENT',
+          }
+          for filename, text in labels.items():
+              image = Image.new('RGB', (1600, 1000), 'white')
+              draw = ImageDraw.Draw(image)
+              draw.rectangle((35, 35, 1565, 965), outline='black', width=8)
+              draw.multiline_text((120, 380), text, fill='black', spacing=35, align='center')
+              image.save(out / filename, format='PNG')
+          PY
+
+          cat > test.js <<'NODE'
+          const fs = require('fs');
+          const puppeteer = require('puppeteer-core');
+
+          const STORE = 'https://kennzeichen-krefeld.com';
+          const EXPECTED_LIVE_THEME = 192981696778;
+          const OUT = '/tmp/live-fake-order-test';
+          const FAKE = {
+            service: 'neuzulassung',
+            firstName: 'Test',
+            lastName: 'Automatisierung-Nicht-Bearbeiten',
+            birthDate: '1990-01-01',
+            phone: '015000000000',
+            street: 'Teststrasse',
+            houseNumber: '1',
+            postalCode: '47829',
+            city: 'Krefeld',
+            iban: 'DE93999999990000000001',
+          };
+
+          const browserCandidates = [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+          ];
+          const executablePath = browserCandidates.find((candidate) => fs.existsSync(candidate));
+          if (!executablePath) throw new Error('Chrome/Chromium not found.');
+
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const isCheckoutUrl = (url) => /\/checkouts?\//.test(url) || url.includes('/checkout');
+
+          async function preparePage(context, label) {
+            const page = await context.newPage();
+            await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
+            await page.setUserAgent(
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+              '(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+            );
+            page.on('pageerror', (error) => {
+              console.log(`[${label}:pageerror] ${error.stack || error.message}`);
+            });
+            page.on('console', (message) => {
+              if (['error', 'warning'].includes(message.type())) {
+                console.log(`[${label}:console:${message.type()}] ${message.text()}`);
+              }
+            });
+            return page;
+          }
+
+          async function clearCart(context, label) {
+            const clearPage = await preparePage(context, `${label}-clear`);
+            await clearPage.goto(`${STORE}/cart?clear-test=${Date.now()}`, {
+              waitUntil: 'domcontentloaded',
+              timeout: 60000,
+            });
+            const result = await clearPage.evaluate(async () => {
+              const response = await fetch('/cart/clear.js', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { Accept: 'application/json' },
+              });
+              let body = {};
+              try { body = await response.json(); } catch (_) {}
+              return { status: response.status, body };
+            });
+            console.log(`[${label}:cart-clear] ${JSON.stringify(result)}`);
+            await clearPage.close();
+            return result;
+          }
+
+          async function visiblePublicFlow(browser) {
+            const context = await browser.createBrowserContext();
+            const page = await preparePage(context, 'public');
+            let cartAdd = null;
+            const azureRequests = [];
+
+            page.on('request', (request) => {
+              if (request.url().includes('azurewebsites.net')) azureRequests.push(request.url());
+            });
+            page.on('response', async (response) => {
+              if (!response.url().includes('/cart/add.js')) return;
+              let body = '';
+              try { body = await response.text(); } catch (_) {}
+              cartAdd = { status: response.status(), url: response.url(), body: body.slice(0, 4000) };
+            });
+
+            const url = `${STORE}/?real-public-button-test=${Date.now()}`;
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
+            await sleep(1800);
+
+            const state = await page.evaluate(() => {
+              const visible = (element) => {
+                if (!element) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return !element.hidden && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const fixed = document.querySelector('#kfz-fixed-order-form');
+              const legacy = document.querySelector('#df-intake-form');
+              return {
+                theme: window.Shopify?.theme || null,
+                repairVersion: document.documentElement.getAttribute('data-kfz-order-fix'),
+                fixedExists: Boolean(fixed),
+                fixedVisible: visible(fixed),
+                legacyExists: Boolean(legacy),
+                legacyVisible: visible(legacy),
+                heading: document.querySelector('#secure-ikfz h2')?.textContent?.trim() || '',
+                visibleText: document.querySelector('#secure-ikfz')?.innerText || '',
+              };
+            });
+            console.log(`[public:state] ${JSON.stringify(state)}`);
+            await page.screenshot({ path: `${OUT}/public-before-click.png`, fullPage: true });
+
+            if (Number(state.theme?.id) !== EXPECTED_LIVE_THEME) {
+              throw new Error(`Unexpected live theme: ${JSON.stringify(state.theme)}`);
+            }
+            if (!state.fixedVisible) {
+              throw new Error(`The fresh public page did not show the repaired selector form: ${JSON.stringify(state)}`);
+            }
+
+            await page.select('#kfz-fixed-order-form select[name="service"]', FAKE.service);
+            await page.click('#kfz-fixed-order-form input[type="checkbox"]');
+            const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null);
+            await page.click('#kfz-fixed-order-form button[type="submit"]');
+            await navigation;
+            await sleep(900);
+
+            const result = {
+              state,
+              finalUrl: page.url(),
+              reachedCheckout: isCheckoutUrl(page.url()),
+              cartAdd,
+              azureRequests,
+            };
+            console.log(`[public:result] ${JSON.stringify(result)}`);
+            fs.writeFileSync(`${OUT}/public-result.json`, JSON.stringify(result, null, 2));
+            await page.screenshot({ path: `${OUT}/public-after-click.png`, fullPage: false });
+
+            if (!result.reachedCheckout) throw new Error(`Public button did not reach checkout: ${result.finalUrl}`);
+            if (!cartAdd || cartAdd.status !== 200) throw new Error(`Public cart add failed: ${JSON.stringify(cartAdd)}`);
+            if (azureRequests.length !== 0) throw new Error(`Public form unexpectedly called Azure: ${JSON.stringify(azureRequests)}`);
+
+            await clearCart(context, 'public');
+            await context.close();
+            return result;
+          }
+
+          async function setInputValue(page, selector, value) {
+            await page.$eval(selector, (element, nextValue) => {
+              element.value = nextValue;
+              element.dispatchEvent(new Event('input', { bubbles: true }));
+              element.dispatchEvent(new Event('change', { bubbles: true }));
+            }, value);
+          }
+
+          async function legacyFakeDataFlow(browser) {
+            const context = await browser.createBrowserContext();
+            const page = await preparePage(context, 'legacy');
+            const azureRequests = [];
+            let azureResponse = null;
+            let cartAdd = null;
+
+            page.on('request', (request) => {
+              if (request.url().includes('azurewebsites.net/api/precheckout/intake')) {
+                azureRequests.push({ method: request.method(), url: request.url() });
+              }
+            });
+            page.on('response', async (response) => {
+              const responseUrl = response.url();
+              if (responseUrl.includes('azurewebsites.net/api/precheckout/intake')) {
+                let body = '';
+                try { body = await response.text(); } catch (_) {}
+                azureResponse = {
+                  status: response.status(),
+                  url: responseUrl,
+                  headers: response.headers(),
+                  body: body.slice(0, 6000),
+                };
+              }
+              if (responseUrl.includes('/cart/add.js')) {
+                let body = '';
+                try { body = await response.text(); } catch (_) {}
+                cartAdd = { status: response.status(), url: responseUrl, body: body.slice(0, 4000) };
+              }
+            });
+
+            const url = `${STORE}/?exact-legacy-form-test=${Date.now()}`;
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
+            await page.waitForSelector('#df-intake-form', { timeout: 30000 });
+            await sleep(1200);
+
+            await page.evaluate(() => {
+              document.querySelector('#kfz-fixed-order-form')?.remove();
+              const legacy = document.querySelector('#df-intake-form');
+              if (!legacy) throw new Error('Legacy form not found.');
+              legacy.hidden = false;
+              legacy.style.setProperty('display', 'block', 'important');
+              legacy.style.setProperty('visibility', 'visible', 'important');
+              const prep = document.querySelector('#secure-ikfz .df-prep');
+              if (prep) prep.hidden = false;
+              const guide = document.querySelector('#df-prep-ok');
+              if (guide) {
+                guide.checked = true;
+                guide.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            });
+
+            await page.select('#df-intake-form select[name="service"]', FAKE.service);
+            await setInputValue(page, '#df-intake-form input[name="firstName"]', FAKE.firstName);
+            await setInputValue(page, '#df-intake-form input[name="lastName"]', FAKE.lastName);
+            await setInputValue(page, '#df-intake-form input[name="birthDate"]', FAKE.birthDate);
+            await setInputValue(page, '#df-intake-form input[name="phone"]', FAKE.phone);
+            await setInputValue(page, '#df-intake-form input[name="street"]', FAKE.street);
+            await setInputValue(page, '#df-intake-form input[name="houseNumber"]', FAKE.houseNumber);
+            await setInputValue(page, '#df-intake-form input[name="postalCode"]', FAKE.postalCode);
+            await setInputValue(page, '#df-intake-form input[name="city"]', FAKE.city);
+            await setInputValue(page, '#df-intake-form input[name="iban"]', FAKE.iban);
+
+            const front = await page.$('#df-intake-form input[name="registrationCertificatePart1Front"]');
+            const back = await page.$('#df-intake-form input[name="registrationCertificatePart1Back"]');
+            const part2 = await page.$('#df-intake-form input[name="registrationCertificatePart2"]');
+            if (!front || !back || !part2) throw new Error('One or more required file fields are missing.');
+            await front.uploadFile(`${OUT}/teil1-vorne-test.png`);
+            await back.uploadFile(`${OUT}/teil1-hinten-test.png`);
+            await part2.uploadFile(`${OUT}/teil2-test.png`);
+
+            const consent = await page.$('#df-intake-form .df-consent input[type="checkbox"]');
+            if (!consent) throw new Error('Consent checkbox not found.');
+            await consent.click();
+
+            const before = await page.evaluate(() => ({
+              url: location.href,
+              firstName: document.querySelector('#df-intake-form input[name="firstName"]')?.value || '',
+              lastName: document.querySelector('#df-intake-form input[name="lastName"]')?.value || '',
+              phone: document.querySelector('#df-intake-form input[name="phone"]')?.value || '',
+              iban: document.querySelector('#df-intake-form input[name="iban"]')?.value || '',
+              selectedService: document.querySelector('#df-intake-form select[name="service"]')?.value || '',
+              files: Array.from(document.querySelectorAll('#df-intake-form input[type="file"]')).map((input) => ({
+                name: input.name,
+                count: input.files?.length || 0,
+                filename: input.files?.[0]?.name || '',
+                size: input.files?.[0]?.size || 0,
+                type: input.files?.[0]?.type || '',
+              })),
+              valid: document.querySelector('#df-intake-form')?.checkValidity() || false,
+            }));
+            console.log(`[legacy:before] ${JSON.stringify(before)}`);
+            await page.screenshot({ path: `${OUT}/legacy-filled-before-click.png`, fullPage: true });
+
+            const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 65000 }).catch(() => null);
+            await page.click('#df-intake-form button[type="submit"]');
+
+            const started = Date.now();
+            while (Date.now() - started < 65000) {
+              const snapshot = await page.evaluate(() => ({
+                url: location.href,
+                status: document.querySelector('#df-status')?.textContent?.trim() || '',
+                statusClass: document.querySelector('#df-status')?.className || '',
+                buttonText: document.querySelector('#df-intake-form button[type="submit"]')?.textContent?.trim() || '',
+                buttonDisabled: Boolean(document.querySelector('#df-intake-form button[type="submit"]')?.disabled),
+              })).catch(() => ({ url: page.url(), status: '', statusClass: '', buttonText: '', buttonDisabled: false }));
+              if (isCheckoutUrl(snapshot.url) || snapshot.status || azureResponse) break;
+              await sleep(500);
+            }
+            await navigation;
+            await sleep(800);
+
+            const after = await page.evaluate(() => ({
+              url: location.href,
+              status: document.querySelector('#df-status')?.textContent?.trim() || '',
+              statusClass: document.querySelector('#df-status')?.className || '',
+              buttonText: document.querySelector('#df-intake-form button[type="submit"]')?.textContent?.trim() || '',
+              buttonDisabled: Boolean(document.querySelector('#df-intake-form button[type="submit"]')?.disabled),
+            })).catch(() => ({
+              url: page.url(),
+              status: '',
+              statusClass: '',
+              buttonText: '',
+              buttonDisabled: false,
+            }));
+
+            const result = {
+              fakeData: FAKE,
+              before,
+              after,
+              reachedCheckout: isCheckoutUrl(page.url()),
+              azureRequests,
+              azureResponse,
+              cartAdd,
+            };
+            console.log(`[legacy:result] ${JSON.stringify(result)}`);
+            fs.writeFileSync(`${OUT}/legacy-result.json`, JSON.stringify(result, null, 2));
+            await page.screenshot({ path: `${OUT}/legacy-after-click.png`, fullPage: true });
+
+            if (!azureResponse && !after.status && !result.reachedCheckout) {
+              throw new Error('Legacy submit produced neither a server response, a visible message nor checkout navigation.');
+            }
+
+            await clearCart(context, 'legacy');
+            await context.close();
+            return result;
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath,
+              headless: true,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
+                '--no-first-run',
+                '--no-default-browser-check',
+              ],
+            });
+
+            try {
+              const publicResult = await visiblePublicFlow(browser);
+              const legacyResult = await legacyFakeDataFlow(browser);
+              fs.writeFileSync(
+                `${OUT}/summary.json`,
+                JSON.stringify({ publicResult, legacyResult }, null, 2)
+              );
+            } finally {
+              await browser.close();
+            }
+          })().catch((error) => {
+            console.error(error.stack || error.message);
+            process.exit(1);
+          });
+          NODE
+
+          node test.js | tee "$OUT/test.log"
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-fake-order-button-test-20260811
+          path: |
+            /tmp/live-fake-order-test/*.json
+            /tmp/live-fake-order-test/*.png
+            /tmp/live-fake-order-test/test.log
+          if-no-files-found: error
+          retention-days: 1
