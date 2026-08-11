@@ -1,0 +1,66 @@
+name: Inspect storefront global scripts
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/inspect-global-scripts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch live HTML and GTM container
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --max-time 60 --connect-timeout 15 -L -sS \
+            -o /tmp/live.html 'https://kennzeichen-krefeld.com/?global-script-inspect=20260811'
+          curl --max-time 60 --connect-timeout 15 -L -sS \
+            -o /tmp/gtm.js 'https://www.googletagmanager.com/gtm.js?id=GTM-N2RJ89C8'
+
+          echo '=== EXTERNAL SCRIPT SOURCES ON LIVE HOME ==='
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          html = Path('/tmp/live.html').read_text(encoding='utf-8', errors='replace')
+          values = sorted(set(re.findall(r'<script[^>]+src=["\']([^"\']+)', html, flags=re.I)))
+          for value in values:
+              print(value)
+          PY
+
+          echo '=== GTM SIZE / HASH ==='
+          wc -c /tmp/gtm.js
+          sha256sum /tmp/gtm.js
+
+          echo '=== URL-LIKE VALUES IN GTM ==='
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          data = Path('/tmp/gtm.js').read_text(encoding='utf-8', errors='replace')
+          patterns = [
+              r'https?://[^"\'\\\s<>]+',
+              r'//[A-Za-z0-9.-]+/[A-Za-z0-9_./?=&%:+@~-]+',
+          ]
+          found = set()
+          for pattern in patterns:
+              found.update(re.findall(pattern, data))
+          for value in sorted(found):
+              print(value[:500])
+          PY
+
+          echo '=== INTERESTING GTM MARKERS ==='
+          grep -Eoi '.{0,120}(github|jsdelivr|raw\.githubusercontent|termin|kennzeichen|azurewebsites|custom html|script src).{0,220}' /tmp/gtm.js | head -200 || true
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: global-script-inspection-20260811
+          path: |
+            /tmp/live.html
+            /tmp/gtm.js
+          retention-days: 1
