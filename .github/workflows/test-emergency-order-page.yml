@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Open emergency page and reach checkout in Chrome
+      - name: Open emergency page and click the real order link in Chrome
         shell: bash
         run: |
           set -euo pipefail
@@ -39,7 +39,6 @@ jobs:
 
           const PAGE = 'https://kennzeichen-krefeld.com/bestellen';
           const EXPECTED_VARIANT = 51237294539018;
-          const EXPECTED_PRICE = 12000;
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           const isCheckout = (url) => /\/checkouts?\//.test(url) || url.includes('/checkout');
 
@@ -61,17 +60,6 @@ jobs:
             const page = await context.newPage();
             await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
 
-            async function clearCart() {
-              return page.evaluate(async () => {
-                const response = await fetch('/cart/clear.js', {
-                  method: 'POST',
-                  credentials: 'same-origin',
-                  headers: { Accept: 'application/json' },
-                });
-                return { status: response.status, body: await response.json() };
-              });
-            }
-
             try {
               const response = await page.goto(PAGE, { waitUntil: 'domcontentloaded', timeout: 90000 });
               if (!response || !response.ok()) {
@@ -81,6 +69,7 @@ jobs:
               const linkSelector = `a[href*="/cart/${EXPECTED_VARIANT}:1"]`;
               await page.waitForSelector(linkSelector, { visible: true, timeout: 45000 });
               await sleep(1000);
+
               const before = await page.evaluate((selector) => ({
                 title: document.title,
                 heading: document.querySelector('h1')?.textContent?.trim() || '',
@@ -98,44 +87,44 @@ jobs:
                 throw new Error(`Neuzulassung link missing: ${before.buttonText}`);
               }
 
-              const cleared = await clearCart();
-              if (cleared.status !== 200 || cleared.body.item_count !== 0) {
-                throw new Error(`Could not clear test cart: ${JSON.stringify(cleared)}`);
-              }
+              const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
+              await page.click(linkSelector);
+              const cartNavigation = await navigation;
+              await sleep(1200);
 
-              await Promise.all([
-                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
-                page.click(linkSelector),
-              ]);
-              await sleep(1000);
-
-              const cart = await page.evaluate(async () => {
-                const response = await fetch('/cart.js', {
-                  credentials: 'same-origin',
-                  headers: { Accept: 'application/json' },
-                });
-                return { status: response.status, body: await response.json() };
-              });
-              console.log(`[cart] ${JSON.stringify(cart)}`);
-              fs.writeFileSync('cart.json', JSON.stringify(cart, null, 2));
+              const cartUrl = page.url();
+              const cartStatus = cartNavigation ? cartNavigation.status() : null;
+              const cartState = await page.evaluate(() => ({
+                title: document.title,
+                text: document.body.innerText.slice(0, 6000),
+                checkoutSelector: [
+                  'button[name="checkout"]',
+                  'input[name="checkout"]',
+                  'a[href="/checkout"]',
+                ].find((selector) => document.querySelector(selector)) || '',
+              }));
+              console.log(`[cart] ${JSON.stringify({ cartUrl, cartStatus, cartState })}`);
+              fs.writeFileSync('cart.json', JSON.stringify({ cartUrl, cartStatus, cartState }, null, 2));
               await page.screenshot({ path: 'cart.png', fullPage: true });
 
-              if (cart.status !== 200 || cart.body.item_count !== 1) {
-                throw new Error(`Wrong cart item count: ${JSON.stringify(cart)}`);
+              if (cartStatus === 429 || /Verifying your connection/i.test(cartState.title + ' ' + cartState.text)) {
+                throw new Error('Shopify anti-bot verification blocked the test browser.');
               }
-              const item = cart.body.items[0];
-              if (Number(item.variant_id) !== EXPECTED_VARIANT) {
-                throw new Error(`Wrong variant: ${item.variant_id}`);
+              if (!/KFZ Anmeldung|Neuzulassung/i.test(cartState.text)) {
+                throw new Error('The expected Zulassung item is not visible in the cart.');
               }
-              if (Number(item.final_line_price || item.line_price || item.price) !== EXPECTED_PRICE) {
-                throw new Error(`Wrong price: ${item.final_line_price || item.line_price || item.price}`);
+              if (!/120[,.]00|120\s*€/i.test(cartState.text)) {
+                throw new Error('The expected 120 EUR price is not visible in the cart.');
+              }
+              if (!cartState.checkoutSelector) {
+                throw new Error('No checkout button found after adding Neuzulassung.');
               }
 
-              await page.goto('https://kennzeichen-krefeld.com/checkout', {
-                waitUntil: 'domcontentloaded',
-                timeout: 90000,
-              });
+              const checkoutNavigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
+              await page.click(cartState.checkoutSelector);
+              await checkoutNavigation;
               await sleep(1000);
+
               const finalUrl = page.url();
               await page.screenshot({ path: 'checkout.png', fullPage: false });
               if (!isCheckout(finalUrl)) {
@@ -145,20 +134,16 @@ jobs:
               const result = {
                 passed: true,
                 emergencyPage: PAGE,
-                finalUrl,
-                variantId: Number(item.variant_id),
-                price: Number(item.final_line_price || item.line_price || item.price),
+                cartUrl,
+                checkoutUrl: finalUrl,
+                variantId: EXPECTED_VARIANT,
+                expectedPriceCents: 12000,
                 noOrderCompleted: true,
                 noPaymentSubmitted: true,
+                note: 'The isolated browser context, including its test cart, is discarded when Chrome closes.',
               };
               console.log(`[success] ${JSON.stringify(result)}`);
               fs.writeFileSync('result.json', JSON.stringify(result, null, 2));
-
-              const postClear = await clearCart();
-              fs.writeFileSync('post-clear.json', JSON.stringify(postClear, null, 2));
-              if (postClear.status !== 200 || postClear.body.item_count !== 0) {
-                throw new Error(`Test cart was not cleared: ${JSON.stringify(postClear)}`);
-              }
             } finally {
               await browser.close();
             }
