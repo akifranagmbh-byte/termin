@@ -1,4 +1,4 @@
-name: Inspect live and preview Shopify order scripts
+name: Verify repaired Shopify order preview
 
 on:
   pull_request:
@@ -10,72 +10,161 @@ permissions:
   contents: read
 
 jobs:
-  inspect-script-loading:
+  verify-preview:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     steps:
-      - name: Inspect static HTML and browser-rendered order state
+      - name: Test all four services in real Chrome sessions
         shell: bash
         run: |
           set -euo pipefail
-          LIVE="https://kennzeichen-krefeld.com/?script-inspect=$(date +%s%N)"
-          PREVIEW="https://kennzeichen-krefeld.com/?preview_theme_id=192982286602&script-inspect=$(date +%s%N)"
+          mkdir -p /tmp/kfz-preview-test
+          cd /tmp/kfz-preview-test
+          npm init -y >/dev/null 2>&1
+          npm install puppeteer-core@24.16.0 --no-audit --no-fund >/dev/null
 
-          for pair in "live|$LIVE" "preview|$PREVIEW"; do
-            label="${pair%%|*}"
-            url="${pair#*|}"
-            echo "=== ${label^^} STATIC: $url ==="
-            curl --max-time 60 --connect-timeout 15 --retry 3 --retry-all-errors -L -sS \
-              -H 'Cache-Control: no-cache, no-store, max-age=0' \
-              -H 'Pragma: no-cache' \
-              "$url" > "/tmp/${label}.html"
-            grep -Eo 'Shopify\.theme = \{[^;]+' "/tmp/${label}.html" | head -1 || true
-            python3 - "$label" <<'PY'
-          import re, sys
-          label = sys.argv[1]
-          html = open(f'/tmp/{label}.html', encoding='utf-8', errors='replace').read()
-          for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I):
-              lowered = src.lower()
-              if any(word in lowered for word in ('kfz', 'order-fix', 'jsdelivr', 'github', 'termin')):
-                  print(f'{label}:script={src}')
-          print(f'{label}:kfz-order-fix-occurrences={html.count("kfz-order-fix")}')
-          print(f'{label}:legacy-error-text-occurrences={html.lower().count("die sichere \\u00fcbermittlung ist gerade nicht")}')
-          PY
-          done
+          cat > test.js <<'NODE'
+          const fs = require('fs');
+          const puppeteer = require('puppeteer-core');
 
-          BROWSER=''
-          for candidate in google-chrome-stable google-chrome chromium chromium-browser; do
-            if command -v "$candidate" >/dev/null 2>&1; then BROWSER=$(command -v "$candidate"); break; fi
-          done
-          test -n "$BROWSER"
+          const STORE = 'https://kennzeichen-krefeld.com';
+          const THEME_ID = 192982286602;
+          const VERSION = '2026-08-11.4';
+          const services = [
+            ['neuzulassung', 51237294539018, 12000, 'Neuzulassung'],
+            ['umschreibung', 53495252254986, 12000, 'Umschreibung'],
+            ['wiederzulassung', 53495253041418, 12000, 'Wiederzulassung'],
+            ['adress-namens-aenderung', 53495252910346, 4900, 'Adress- oder Namensänderung'],
+          ];
+          const candidates = [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+          ];
+          const executablePath = candidates.find((path) => fs.existsSync(path));
+          if (!executablePath) throw new Error('Chrome/Chromium not found.');
 
-          for pair in "live|$LIVE" "preview|$PREVIEW"; do
-            label="${pair%%|*}"
-            url="${pair#*|}"
-            "$BROWSER" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
-              --virtual-time-budget=15000 --dump-dom "$url" > "/tmp/${label}-rendered.html"
-            echo "=== ${label^^} RENDERED ==="
-            grep -Eo 'Shopify\.theme = \{[^;]+' "/tmp/${label}-rendered.html" | head -1 || true
-            python3 - "$label" <<'PY'
-          import re, sys
-          label = sys.argv[1]
-          html = open(f'/tmp/{label}-rendered.html', encoding='utf-8', errors='replace').read()
-          print(f'{label}:fixed-form={"id=\"kfz-fixed-order-form\"" in html}')
-          print(f'{label}:legacy-form={"id=\"df-intake-form\"" in html}')
-          print(f'{label}:legacy-error-text={"Die sichere \\u00dcbermittlung ist gerade nicht" in html or "Die sichere &Uuml;bermittlung ist gerade nicht" in html}')
-          print(f'{label}:repair-version={re.findall(r"data-kfz-order-fix=\\\"([^\\\"]+)", html)[:3]}')
-          for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I):
-              lowered = src.lower()
-              if any(word in lowered for word in ('kfz', 'order-fix', 'jsdelivr', 'github', 'termin')):
-                  print(f'{label}:rendered-script={src}')
-          PY
-          done
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-      - name: Upload evidence
+          async function testService(browser, service, variantId, expectedPrice, expectedTitle) {
+            const context = await browser.createBrowserContext();
+            const page = await context.newPage();
+            await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
+            await page.setExtraHTTPHeaders({
+              'Cache-Control': 'no-cache, no-store, max-age=0',
+              Pragma: 'no-cache',
+            });
+
+            const azureRequests = [];
+            let cartResponse = null;
+            page.on('request', (request) => {
+              if (request.url().includes('azurewebsites.net')) azureRequests.push(request.url());
+            });
+            page.on('response', async (response) => {
+              if (!response.url().includes('/cart/add.js')) return;
+              let body = '';
+              try { body = await response.text(); } catch (_) {}
+              cartResponse = { status: response.status(), body };
+            });
+            page.on('pageerror', (error) => console.log(`[${service}:pageerror] ${error.stack || error.message}`));
+            page.on('console', (message) => {
+              if (message.type() === 'error' || message.type() === 'warning') {
+                console.log(`[${service}:console:${message.type()}] ${message.text()}`);
+              }
+            });
+
+            const previewUrl = `${STORE}/?preview_theme_id=${THEME_ID}&service-test=${service}-${Date.now()}`;
+            await page.goto(previewUrl, { waitUntil: 'networkidle2', timeout: 90000 });
+            await page.waitForSelector('#kfz-fixed-order-form', { visible: true, timeout: 30000 });
+            await sleep(1000);
+
+            const state = await page.evaluate(() => {
+              const fixed = document.querySelector('#kfz-fixed-order-form');
+              const rect = fixed ? fixed.getBoundingClientRect() : null;
+              return {
+                theme: window.Shopify?.theme || null,
+                repairVersion: document.documentElement.getAttribute('data-kfz-order-fix'),
+                fixedExists: Boolean(fixed),
+                fixedVisible: Boolean(rect && rect.width > 0 && rect.height > 0),
+                legacyExists: Boolean(document.querySelector('#df-intake-form')),
+                prepExists: Boolean(document.querySelector('#secure-ikfz .df-prep')),
+                visibleText: document.querySelector('#secure-ikfz')?.innerText || '',
+              };
+            });
+            console.log(`[${service}:state] ${JSON.stringify(state)}`);
+            if (Number(state.theme?.id) !== THEME_ID) throw new Error(`${service}: wrong preview theme`);
+            if (state.repairVersion !== VERSION) throw new Error(`${service}: wrong repair version`);
+            if (!state.fixedExists || !state.fixedVisible) throw new Error(`${service}: repaired form not visible`);
+            if (state.legacyExists || state.prepExists) throw new Error(`${service}: legacy upload still present`);
+            if (/sichere übermittlung ist gerade nicht möglich/i.test(state.visibleText)) {
+              throw new Error(`${service}: old failure message is still visible`);
+            }
+
+            await page.select('#kfz-fixed-order-form select[name="service"]', service);
+            await page.click('#kfz-fixed-order-form input[name="privacyAccepted"]');
+            await Promise.all([
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+              page.click('#kfz-fixed-order-form button[type="submit"]'),
+            ]);
+
+            const checkoutUrl = page.url();
+            console.log(`[${service}:checkout] ${checkoutUrl}`);
+            if (!/\/checkouts?\//.test(checkoutUrl) && !checkoutUrl.includes('/checkout')) {
+              throw new Error(`${service}: checkout not reached`);
+            }
+            if (azureRequests.length !== 0) throw new Error(`${service}: legacy Azure endpoint was called`);
+            if (!cartResponse || cartResponse.status !== 200) throw new Error(`${service}: cart add failed`);
+
+            const parsed = JSON.parse(cartResponse.body);
+            const item = Array.isArray(parsed.items) ? parsed.items[0] : parsed;
+            if (Number(item.variant_id || item.id) !== variantId) throw new Error(`${service}: wrong variant`);
+            if (Number(item.final_line_price || item.line_price || item.price) !== expectedPrice) {
+              throw new Error(`${service}: wrong price`);
+            }
+            if (item.properties?.Zulassungsvorgang !== expectedTitle) throw new Error(`${service}: wrong title property`);
+            if (item.properties?.['Bestellablauf-Version'] !== VERSION) throw new Error(`${service}: wrong flow version`);
+
+            const clearPage = await context.newPage();
+            await clearPage.goto(`${STORE}/cart?clear=${Date.now()}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            const cleared = await clearPage.evaluate(async () => {
+              const response = await fetch('/cart/clear.js', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { Accept: 'application/json' },
+              });
+              return { status: response.status, data: await response.json() };
+            });
+            if (cleared.status !== 200 || cleared.data.item_count !== 0) throw new Error(`${service}: cart not cleared`);
+            await page.screenshot({ path: `/tmp/kfz-preview-test/${service}.png`, fullPage: false });
+            await context.close();
+            console.log(`[${service}:success] variant=${variantId} price=${expectedPrice}`);
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath,
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+            });
+            try {
+              for (const service of services) await testService(browser, ...service);
+            } finally {
+              await browser.close();
+            }
+          })().catch((error) => {
+            console.error(error.stack || error.message);
+            process.exit(1);
+          });
+          NODE
+
+          node test.js | tee /tmp/kfz-preview-test/test.log
+
+      - name: Upload test evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: inspect-order-script-sources
-          path: /tmp/*live*.html
-          if-no-files-found: warn
+          name: repaired-shopify-preview-evidence
+          path: /tmp/kfz-preview-test
+          if-no-files-found: error
           retention-days: 1
