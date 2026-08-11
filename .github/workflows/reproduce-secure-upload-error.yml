@@ -1,4 +1,4 @@
-name: Reproduce secure upload live error
+name: Inspect live and preview Shopify order scripts
 
 on:
   pull_request:
@@ -10,300 +10,72 @@ permissions:
   contents: read
 
 jobs:
-  reproduce-live-flow:
+  inspect-script-loading:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 8
     steps:
-      - name: Exercise the visible form and the legacy Azure upload in Chrome
+      - name: Inspect static HTML and browser-rendered order state
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/kfz-secure-upload-test
-          cd /tmp/kfz-secure-upload-test
+          LIVE="https://kennzeichen-krefeld.com/?script-inspect=$(date +%s%N)"
+          PREVIEW="https://kennzeichen-krefeld.com/?preview_theme_id=192982286602&script-inspect=$(date +%s%N)"
 
-          npm init -y >/dev/null 2>&1
-          npm install puppeteer-core@24.16.0 --no-audit --no-fund >/dev/null
-
-          python3 - <<'PY'
-          import base64
-          from pathlib import Path
-
-          png = base64.b64decode(
-              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4p8AAAAASUVORK5CYII='
-          )
-          for name in ('part1-front.png', 'part1-back.png', 'part2.png'):
-              Path('/tmp/kfz-secure-upload-test', name).write_bytes(png)
+          for pair in "live|$LIVE" "preview|$PREVIEW"; do
+            label="${pair%%|*}"
+            url="${pair#*|}"
+            echo "=== ${label^^} STATIC: $url ==="
+            curl --max-time 60 --connect-timeout 15 --retry 3 --retry-all-errors -L -sS \
+              -H 'Cache-Control: no-cache, no-store, max-age=0' \
+              -H 'Pragma: no-cache' \
+              "$url" > "/tmp/${label}.html"
+            grep -Eo 'Shopify\.theme = \{[^;]+' "/tmp/${label}.html" | head -1 || true
+            python3 - "$label" <<'PY'
+          import re, sys
+          label = sys.argv[1]
+          html = open(f'/tmp/{label}.html', encoding='utf-8', errors='replace').read()
+          for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I):
+              lowered = src.lower()
+              if any(word in lowered for word in ('kfz', 'order-fix', 'jsdelivr', 'github', 'termin')):
+                  print(f'{label}:script={src}')
+          print(f'{label}:kfz-order-fix-occurrences={html.count("kfz-order-fix")}')
+          print(f'{label}:legacy-error-text-occurrences={html.lower().count("die sichere \\u00fcbermittlung ist gerade nicht")}')
           PY
+          done
 
-          cat > live-test.js <<'NODE'
-          const fs = require('fs');
-          const puppeteer = require('puppeteer-core');
+          BROWSER=''
+          for candidate in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then BROWSER=$(command -v "$candidate"); break; fi
+          done
+          test -n "$BROWSER"
 
-          const STORE = 'https://kennzeichen-krefeld.com';
-          const candidates = [
-            '/usr/bin/google-chrome-stable',
-            '/usr/bin/google-chrome',
-            '/usr/bin/chromium',
-            '/usr/bin/chromium-browser',
-          ];
-          const executablePath = candidates.find((candidate) => fs.existsSync(candidate));
-          if (!executablePath) throw new Error('No Chrome/Chromium executable found.');
+          for pair in "live|$LIVE" "preview|$PREVIEW"; do
+            label="${pair%%|*}"
+            url="${pair#*|}"
+            "$BROWSER" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+              --virtual-time-budget=15000 --dump-dom "$url" > "/tmp/${label}-rendered.html"
+            echo "=== ${label^^} RENDERED ==="
+            grep -Eo 'Shopify\.theme = \{[^;]+' "/tmp/${label}-rendered.html" | head -1 || true
+            python3 - "$label" <<'PY'
+          import re, sys
+          label = sys.argv[1]
+          html = open(f'/tmp/{label}-rendered.html', encoding='utf-8', errors='replace').read()
+          print(f'{label}:fixed-form={"id=\"kfz-fixed-order-form\"" in html}')
+          print(f'{label}:legacy-form={"id=\"df-intake-form\"" in html}')
+          print(f'{label}:legacy-error-text={"Die sichere \\u00dcbermittlung ist gerade nicht" in html or "Die sichere &Uuml;bermittlung ist gerade nicht" in html}')
+          print(f'{label}:repair-version={re.findall(r"data-kfz-order-fix=\\\"([^\\\"]+)", html)[:3]}')
+          for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I):
+              lowered = src.lower()
+              if any(word in lowered for word in ('kfz', 'order-fix', 'jsdelivr', 'github', 'termin')):
+                  print(f'{label}:rendered-script={src}')
+          PY
+          done
 
-          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-          const importantUrl = (url) =>
-            url.includes('azurewebsites.net') ||
-            url.includes('/cart/add') ||
-            url.includes('/cart/clear') ||
-            url.includes('/checkout');
-
-          async function attachDiagnostics(page, label) {
-            page.on('console', (message) => {
-              console.log(`[${label}:console:${message.type()}] ${message.text()}`);
-            });
-            page.on('pageerror', (error) => {
-              console.log(`[${label}:pageerror] ${error.stack || error.message}`);
-            });
-            page.on('requestfailed', (request) => {
-              if (importantUrl(request.url())) {
-                console.log(
-                  `[${label}:requestfailed] ${request.method()} ${request.url()} :: ${JSON.stringify(request.failure())}`
-                );
-              }
-            });
-            page.on('response', async (response) => {
-              if (!importantUrl(response.url())) return;
-              let body = '';
-              try {
-                body = await response.text();
-              } catch (error) {
-                body = `<body unavailable: ${error.message}>`;
-              }
-              console.log(
-                `[${label}:response] ${response.status()} ${response.request().method()} ${response.url()} :: ${body.slice(0, 1200)}`
-              );
-            });
-          }
-
-          async function formState(page) {
-            return page.evaluate(() => {
-              const visible = (element) => {
-                if (!element) return false;
-                const style = window.getComputedStyle(element);
-                const rect = element.getBoundingClientRect();
-                return (
-                  !element.hidden &&
-                  style.display !== 'none' &&
-                  style.visibility !== 'hidden' &&
-                  Number(style.opacity || '1') > 0 &&
-                  rect.width > 0 &&
-                  rect.height > 0
-                );
-              };
-              const fixed = document.querySelector('#kfz-fixed-order-form');
-              const legacy = document.querySelector('#df-intake-form');
-              return {
-                url: location.href,
-                title: document.title,
-                theme: window.Shopify && window.Shopify.theme ? window.Shopify.theme : null,
-                repairFlag: document.documentElement.getAttribute('data-kfz-order-fix'),
-                fixedExists: Boolean(fixed),
-                fixedVisible: visible(fixed),
-                legacyExists: Boolean(legacy),
-                legacyHiddenAttribute: legacy ? legacy.hidden : null,
-                legacyVisible: visible(legacy),
-                mainHeading: document.querySelector('#secure-ikfz h2')?.textContent?.trim() || '',
-                visibleStatus: Array.from(document.querySelectorAll('#secure-ikfz [role="alert"], #secure-ikfz [role="status"]'))
-                  .filter(visible)
-                  .map((element) => element.textContent.trim())
-                  .filter(Boolean),
-              };
-            });
-          }
-
-          async function waitForCheckoutOrStatus(page, statusSelector, timeoutMs) {
-            const started = Date.now();
-            while (Date.now() - started < timeoutMs) {
-              const result = await page.evaluate((selector) => ({
-                url: location.href,
-                status: document.querySelector(selector)?.textContent?.trim() || '',
-              }), statusSelector);
-              if (/\/checkouts?\//.test(result.url) || result.url.includes('/checkout')) return result;
-              if (result.status) console.log(`[poll] ${JSON.stringify(result)}`);
-              await sleep(500);
-            }
-            return page.evaluate((selector) => ({
-              url: location.href,
-              status: document.querySelector(selector)?.textContent?.trim() || '',
-            }), statusSelector);
-          }
-
-          (async () => {
-            const browser = await puppeteer.launch({
-              executablePath,
-              headless: true,
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--no-first-run',
-                '--no-default-browser-check',
-              ],
-            });
-
-            try {
-              const page = await browser.newPage();
-              await attachDiagnostics(page, 'visible-flow');
-              await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
-              await page.setExtraHTTPHeaders({
-                'Cache-Control': 'no-cache, no-store, max-age=0',
-                Pragma: 'no-cache',
-              });
-              const url = `${STORE}/?actual-submit-test=${Date.now()}`;
-              await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
-              await sleep(2500);
-
-              const before = await formState(page);
-              console.log(`[visible-flow:before] ${JSON.stringify(before)}`);
-              fs.writeFileSync('/tmp/kfz-secure-upload-test/visible-before.json', JSON.stringify(before, null, 2));
-              await page.screenshot({ path: '/tmp/kfz-secure-upload-test/visible-before.png', fullPage: true });
-
-              if (!before.fixedExists || !before.fixedVisible) {
-                throw new Error(`The repaired visible form is not active: ${JSON.stringify(before)}`);
-              }
-              if (before.legacyVisible) {
-                throw new Error(`The legacy Azure form is still visible: ${JSON.stringify(before)}`);
-              }
-
-              await page.select('#kfz-fixed-order-form select[name="service"]', 'neuzulassung');
-              await page.click('#kfz-fixed-order-form input[type="checkbox"]');
-              await page.click('#kfz-fixed-order-form button[type="submit"]');
-              const visibleResult = await waitForCheckoutOrStatus(page, '#kfz-fixed-order-form .kfz-fixed-status', 35000);
-              console.log(`[visible-flow:after-submit] ${JSON.stringify(visibleResult)}`);
-              fs.writeFileSync('/tmp/kfz-secure-upload-test/visible-result.json', JSON.stringify(visibleResult, null, 2));
-              await page.screenshot({ path: '/tmp/kfz-secure-upload-test/visible-after.png', fullPage: true });
-
-              if (!/\/checkouts?\//.test(visibleResult.url) && !visibleResult.url.includes('/checkout')) {
-                throw new Error(`Visible form did not reach checkout: ${JSON.stringify(visibleResult)}`);
-              }
-
-              const clearPage = await browser.newPage();
-              await attachDiagnostics(clearPage, 'clear-cart');
-              await clearPage.goto(`${STORE}/cart?clear-test=${Date.now()}`, {
-                waitUntil: 'domcontentloaded',
-                timeout: 60000,
-              });
-              const clearResult = await clearPage.evaluate(async () => {
-                const response = await fetch('/cart/clear.js', {
-                  method: 'POST',
-                  credentials: 'same-origin',
-                  headers: { Accept: 'application/json' },
-                });
-                return { status: response.status, body: await response.text() };
-              });
-              console.log(`[clear-cart:result] ${JSON.stringify(clearResult)}`);
-              await clearPage.close();
-
-              const legacyPage = await browser.newPage();
-              await attachDiagnostics(legacyPage, 'legacy-upload');
-              await legacyPage.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
-              await legacyPage.setExtraHTTPHeaders({
-                'Cache-Control': 'no-cache, no-store, max-age=0',
-                Pragma: 'no-cache',
-              });
-              await legacyPage.goto(`${STORE}/?legacy-endpoint-test=${Date.now()}`, {
-                waitUntil: 'networkidle2',
-                timeout: 90000,
-              });
-              await sleep(2000);
-
-              await legacyPage.evaluate(() => {
-                document.querySelector('#kfz-fixed-order-form')?.remove();
-                const legacy = document.querySelector('#df-intake-form');
-                if (!legacy) throw new Error('Legacy form not found.');
-                legacy.hidden = false;
-                legacy.style.display = 'block';
-                const guide = document.querySelector('#df-prep-ok');
-                if (guide) guide.checked = true;
-              });
-
-              await legacyPage.select('#df-intake-form select[name="service"]', 'neuzulassung');
-              await legacyPage.type('#df-intake-form input[name="firstName"]', 'TEST-AUTOMATION');
-              await legacyPage.type('#df-intake-form input[name="lastName"]', 'NICHT-BEARBEITEN');
-              await legacyPage.type('#df-intake-form input[name="birthDate"]', '1990-01-01');
-              await legacyPage.type('#df-intake-form input[name="street"]', 'Teststrasse');
-              await legacyPage.type('#df-intake-form input[name="houseNumber"]', '1');
-              await legacyPage.type('#df-intake-form input[name="postalCode"]', '47829');
-              await legacyPage.type('#df-intake-form input[name="city"]', 'Krefeld');
-              await legacyPage.type('#df-intake-form input[name="iban"]', 'DE89370400440532013000');
-
-              const front = await legacyPage.$('#df-intake-form input[name="registrationCertificatePart1Front"]');
-              const back = await legacyPage.$('#df-intake-form input[name="registrationCertificatePart1Back"]');
-              const part2 = await legacyPage.$('#df-intake-form input[name="registrationCertificatePart2"]');
-              await front.uploadFile('/tmp/kfz-secure-upload-test/part1-front.png');
-              await back.uploadFile('/tmp/kfz-secure-upload-test/part1-back.png');
-              await part2.uploadFile('/tmp/kfz-secure-upload-test/part2.png');
-              await legacyPage.click('#df-intake-form .df-consent input[type="checkbox"]');
-
-              const legacyBefore = await formState(legacyPage);
-              console.log(`[legacy-upload:before] ${JSON.stringify(legacyBefore)}`);
-              await legacyPage.click('#df-intake-form button[type="submit"]');
-              const legacyResult = await waitForCheckoutOrStatus(legacyPage, '#df-status', 35000);
-              const legacyDetails = await legacyPage.evaluate(() => ({
-                url: location.href,
-                status: document.querySelector('#df-status')?.textContent?.trim() || '',
-                statusClass: document.querySelector('#df-status')?.className || '',
-                buttonText: document.querySelector('#df-intake-form button[type="submit"]')?.textContent?.trim() || '',
-                buttonDisabled: Boolean(document.querySelector('#df-intake-form button[type="submit"]')?.disabled),
-              }));
-              console.log(`[legacy-upload:after-submit] ${JSON.stringify({ ...legacyResult, ...legacyDetails })}`);
-              fs.writeFileSync(
-                '/tmp/kfz-secure-upload-test/legacy-result.json',
-                JSON.stringify({ ...legacyResult, ...legacyDetails }, null, 2)
-              );
-              await legacyPage.screenshot({ path: '/tmp/kfz-secure-upload-test/legacy-after.png', fullPage: true });
-              await legacyPage.close();
-            } finally {
-              await browser.close();
-            }
-          })().catch((error) => {
-            console.error(error.stack || error.message);
-            process.exitCode = 1;
-          });
-          NODE
-
-          node live-test.js | tee /tmp/kfz-secure-upload-test/browser.log
-
-      - name: Call the Azure intake endpoint directly with the same multipart fields
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          ENDPOINT='https://fn-kfz-zulassung-prod-260810-czaxc8chcze9eufb.germanywestcentral-01.azurewebsites.net/api/precheckout/intake'
-          curl --max-time 90 --connect-timeout 20 -sS -i \
-            -H 'Origin: https://kennzeichen-krefeld.com' \
-            -H 'Accept: application/json' \
-            -F 'service=neuzulassung' \
-            -F 'firstName=TEST-AUTOMATION' \
-            -F 'lastName=NICHT-BEARBEITEN' \
-            -F 'birthDate=1990-01-01' \
-            -F 'street=Teststrasse' \
-            -F 'houseNumber=1' \
-            -F 'postalCode=47829' \
-            -F 'city=Krefeld' \
-            -F 'iban=DE89370400440532013000' \
-            -F 'registrationCertificatePart1Front=@/tmp/kfz-secure-upload-test/part1-front.png;type=image/png' \
-            -F 'registrationCertificatePart1Back=@/tmp/kfz-secure-upload-test/part1-back.png;type=image/png' \
-            -F 'registrationCertificatePart2=@/tmp/kfz-secure-upload-test/part2.png;type=image/png' \
-            "$ENDPOINT" | tee /tmp/kfz-secure-upload-test/azure-direct-response.txt
-          echo "curl_exit=${PIPESTATUS[0]}" | tee -a /tmp/kfz-secure-upload-test/azure-direct-response.txt
-          exit 0
-
-      - name: Upload reproduction evidence
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: secure-upload-reproduction-20260811
-          path: /tmp/kfz-secure-upload-test
-          if-no-files-found: error
+          name: inspect-order-script-sources
+          path: /tmp/*live*.html
+          if-no-files-found: warn
           retention-days: 1
