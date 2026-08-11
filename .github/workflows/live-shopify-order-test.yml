@@ -1,4 +1,4 @@
-name: Live Shopify order flow test — stable verification
+name: Live Shopify order flow test — isolated customer sessions
 
 on:
   pull_request:
@@ -10,42 +10,31 @@ permissions:
   contents: read
 
 jobs:
-  live-order-flow:
+  theme-and-form:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 6
     steps:
-      - name: Verify published theme and rendered order form without stale CDN cache
+      - name: Verify active theme repeatedly and render the repaired form
         shell: bash
         run: |
           set -euo pipefail
           STORE='https://kennzeichen-krefeld.com'
-          success='false'
 
-          for attempt in 1 2 3 4 5 6; do
-            stamp="$(date +%s%N)-${attempt}"
-            LIVE_URL="${STORE}/?live-order-test=${stamp}"
-            echo "theme_attempt=${attempt} url=${LIVE_URL}"
-
-            curl --max-time 60 --connect-timeout 15 --retry 3 --retry-all-errors --retry-delay 2 -L -sS \
+          for attempt in 1 2 3; do
+            LIVE_URL="${STORE}/?live-theme-check=$(date +%s%N)-${attempt}"
+            curl --max-time 60 --connect-timeout 15 -L -sS \
               -H 'Cache-Control: no-cache, no-store, max-age=0' \
               -H 'Pragma: no-cache' \
-              -D /tmp/live-headers.txt \
-              -o /tmp/live-static.html \
+              -D "/tmp/theme-${attempt}-headers.txt" \
+              -o "/tmp/theme-${attempt}.html" \
               "$LIVE_URL"
 
-            theme_marker=$(grep -Eo 'Shopify\.theme = \{[^;]+' /tmp/live-static.html | head -1 || true)
-            echo "$theme_marker"
-
-            if grep -q '"id":192981696778' /tmp/live-static.html \
-              && grep -q '"role":"main"' /tmp/live-static.html \
-              && grep -q 'kfz-order-fix.js' /tmp/live-static.html; then
-              success='true'
-              break
-            fi
-            sleep 3
+            marker=$(grep -Eo 'Shopify\.theme = \{[^;]+' "/tmp/theme-${attempt}.html" | head -1 || true)
+            echo "attempt=${attempt} ${marker}"
+            grep -q '"id":192981696778' "/tmp/theme-${attempt}.html"
+            grep -q '"role":"main"' "/tmp/theme-${attempt}.html"
+            grep -q 'kfz-order-fix.js' "/tmp/theme-${attempt}.html"
           done
-
-          test "$success" = 'true'
 
           BROWSER=''
           for candidate in google-chrome-stable google-chrome chromium chromium-browser; do
@@ -56,7 +45,6 @@ jobs:
           done
           test -n "$BROWSER"
 
-          BROWSER_URL="${STORE}/?live-browser-test=$(date +%s%N)"
           "$BROWSER" \
             --headless=new \
             --no-sandbox \
@@ -66,147 +54,161 @@ jobs:
             --media-cache-size=1 \
             --virtual-time-budget=18000 \
             --dump-dom \
-            "$BROWSER_URL" > /tmp/live-rendered.html
+            "${STORE}/?live-browser-check=$(date +%s%N)" > /tmp/live-rendered.html
 
-          echo '=== RENDERED REPAIR FORM ==='
           grep -n 'id="kfz-fixed-order-form"' /tmp/live-rendered.html | head -1
           grep -q 'Zulassung auswählen. Sicher bezahlen. Unterlagen geschützt nachreichen.' /tmp/live-rendered.html
           grep -Eq '<form id="df-intake-form"[^>]*hidden' /tmp/live-rendered.html
-
           for value in neuzulassung umschreibung wiederzulassung adress-namens-aenderung; do
             grep -q "value=\"${value}\"" /tmp/live-rendered.html
           done
 
-      - name: Test all four services through cart and checkout
+      - name: Upload theme evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-theme-and-form-evidence
+          path: |
+            /tmp/theme-*.html
+            /tmp/theme-*-headers.txt
+            /tmp/live-rendered.html
+          if-no-files-found: warn
+          retention-days: 1
+
+  service-checkout:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: neuzulassung
+            label: Neuzulassung
+            variant: '51237294539018'
+            price: '12000'
+            product_fragment: 'KFZ Anmeldung'
+          - key: umschreibung
+            label: Umschreibung
+            variant: '53495252254986'
+            price: '12000'
+            product_fragment: 'Digitale Kfz-Umschreibung'
+          - key: wiederzulassung
+            label: Wiederzulassung
+            variant: '53495253041418'
+            price: '12000'
+            product_fragment: 'Digitale Kfz-Wiederzulassung'
+          - key: adress-namens-aenderung
+            label: Adress- oder Namensänderung
+            variant: '53495252910346'
+            price: '4900'
+            product_fragment: 'Digitale Kfz-Adress'
+
+    steps:
+      - name: Add selected service and reach checkout in an isolated session
         shell: bash
+        env:
+          SERVICE_KEY: ${{ matrix.key }}
+          SERVICE_LABEL: ${{ matrix.label }}
+          VARIANT_ID: ${{ matrix.variant }}
+          EXPECTED_PRICE: ${{ matrix.price }}
+          PRODUCT_FRAGMENT: ${{ matrix.product_fragment }}
         run: |
           set -euo pipefail
           STORE='https://kennzeichen-krefeld.com'
           VERSION='2026-08-11.3-LIVE-TEST'
+          COOKIE="/tmp/${SERVICE_KEY}-cookies.txt"
+          ADD_BODY="/tmp/${SERVICE_KEY}-cart-add.json"
+          ADD_HEADERS="/tmp/${SERVICE_KEY}-cart-add-headers.txt"
+          CHECKOUT_BODY="/tmp/${SERVICE_KEY}-checkout.html"
+          CHECKOUT_HEADERS="/tmp/${SERVICE_KEY}-checkout-headers.txt"
+          CLEAR_BODY="/tmp/${SERVICE_KEY}-cart-clear.json"
 
-          read_cart_with_retry() {
-            cookie="$1"
-            output="$2"
-            for attempt in 1 2 3 4 5 6; do
-              curl --max-time 45 --connect-timeout 15 --retry 2 --retry-all-errors --retry-delay 1 -sS \
-                -c "$cookie" -b "$cookie" \
+          cleanup() {
+            if [ -f "$COOKIE" ]; then
+              curl --max-time 30 --connect-timeout 10 -sS \
+                -c "$COOKIE" -b "$COOKIE" \
+                -X POST "${STORE}/cart/clear.js" \
                 -H 'Accept: application/json' \
-                -H 'Cache-Control: no-cache, no-store, max-age=0' \
-                "${STORE}/cart.js?live_test=$(date +%s%N)" > "$output" || true
-              if python3 - "$output" <<'PY'
-          import json, sys
-          try:
-              data = json.load(open(sys.argv[1], encoding='utf-8'))
-              assert isinstance(data, dict)
-              assert 'item_count' in data
-          except Exception:
-              raise SystemExit(1)
-          PY
-              then
-                return 0
-              fi
-              echo "cart_read_retry=${attempt}"
-              sleep 2
-            done
-            return 1
+                -o "$CLEAR_BODY" || true
+            fi
           }
+          trap cleanup EXIT
 
-          test_service() {
-            service="$1"
-            variant="$2"
-            expected_service="$3"
-            expected_price="$4"
-
-            cookie="/tmp/${service}-cookies.txt"
-            add_body="/tmp/${service}-cart-add.json"
-            cart_body="/tmp/${service}-cart.json"
-            checkout_headers="/tmp/${service}-checkout-headers.txt"
-            checkout_body="/tmp/${service}-checkout.html"
-            clear_body="/tmp/${service}-cart-clear.json"
-            rm -f "$cookie" "$add_body" "$cart_body" "$checkout_headers" "$checkout_body" "$clear_body"
-
-            payload=$(python3 - "$variant" "$expected_service" "$VERSION" <<'PY'
+          payload=$(python3 - "$VARIANT_ID" "$SERVICE_LABEL" "$VERSION" <<'PY'
           import json, sys
-          variant, service, version = sys.argv[1:]
+          variant, label, version = sys.argv[1:]
           print(json.dumps({
               'items': [{
                   'id': int(variant),
                   'quantity': 1,
                   'properties': {
-                      'Zulassungsvorgang': service,
+                      'Zulassungsvorgang': label,
                       'Unterlagenstatus': 'Sicherer Yousign-Link nach Bestellung erforderlich',
                       'Bestellablauf-Version': version,
                   },
               }],
           }, ensure_ascii=False))
           PY
-            )
+          )
 
-            add_code=$(curl --max-time 45 --connect-timeout 15 --retry 3 --retry-all-errors --retry-delay 2 -sS \
-              -c "$cookie" -b "$cookie" \
-              -o "$add_body" -w '%{http_code}' \
-              -X POST "${STORE}/cart/add.js" \
-              -H 'Content-Type: application/json' \
-              -H 'Accept: application/json' \
-              --data "$payload")
-            echo "${service}: cart_add_http=${add_code}"
-            test "$add_code" = '200'
+          add_code=$(curl --max-time 45 --connect-timeout 15 -sS \
+            -c "$COOKIE" -b "$COOKIE" \
+            -D "$ADD_HEADERS" \
+            -o "$ADD_BODY" -w '%{http_code}' \
+            -X POST "${STORE}/cart/add.js" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' \
+            --data "$payload")
+          echo "service=${SERVICE_LABEL} cart_add_http=${add_code}"
+          test "$add_code" = '200'
 
-            read_cart_with_retry "$cookie" "$cart_body"
-
-            python3 - "$cart_body" "$variant" "$expected_service" "$expected_price" "$VERSION" <<'PY'
+          python3 - "$ADD_BODY" "$VARIANT_ID" "$SERVICE_LABEL" "$EXPECTED_PRICE" "$VERSION" <<'PY'
           import json, sys
-          path, variant, expected_service, expected_price, version = sys.argv[1:]
-          cart = json.load(open(path, encoding='utf-8'))
-          assert cart['item_count'] == 1, cart
-          item = cart['items'][0]
-          assert item['variant_id'] == int(variant), item
-          assert item['final_line_price'] == int(expected_price), item
-          assert item['properties']['Zulassungsvorgang'] == expected_service, item
-          assert item['properties']['Unterlagenstatus'] == 'Sicherer Yousign-Link nach Bestellung erforderlich', item
-          assert item['properties']['Bestellablauf-Version'] == version, item
-          print('verified:', item['title'], item['final_line_price'], item['properties'])
+          path, variant, label, expected_price, version = sys.argv[1:]
+          data = json.load(open(path, encoding='utf-8'))
+          items = data.get('items') if isinstance(data, dict) else None
+          if not items:
+              items = [data]
+          item = items[0]
+          actual_variant = item.get('variant_id', item.get('id'))
+          actual_price = item.get('final_line_price', item.get('line_price', item.get('price')))
+          properties = item.get('properties') or {}
+          assert int(actual_variant) == int(variant), item
+          assert int(actual_price) == int(expected_price), item
+          assert properties.get('Zulassungsvorgang') == label, item
+          assert properties.get('Unterlagenstatus') == 'Sicherer Yousign-Link nach Bestellung erforderlich', item
+          assert properties.get('Bestellablauf-Version') == version, item
+          print('cart_add_verified=', item.get('title'), actual_price, properties)
           PY
 
-            checkout_result=$(curl --max-time 60 --connect-timeout 15 --retry 3 --retry-all-errors --retry-delay 2 -L -sS \
-              -c "$cookie" -b "$cookie" \
-              -D "$checkout_headers" \
-              -o "$checkout_body" \
-              -w '%{http_code} %{url_effective}' \
-              "${STORE}/checkout?live_test=$(date +%s%N)")
-            echo "${service}: checkout=${checkout_result}"
-            checkout_code=${checkout_result%% *}
-            checkout_url=${checkout_result#* }
-            test "$checkout_code" = '200'
-            echo "$checkout_url" | grep -Eq '/checkout|/checkouts/'
+          checkout_result=$(curl --max-time 60 --connect-timeout 15 -L -sS \
+            -c "$COOKIE" -b "$COOKIE" \
+            -D "$CHECKOUT_HEADERS" \
+            -o "$CHECKOUT_BODY" \
+            -w '%{http_code} %{url_effective}' \
+            "${STORE}/checkout?isolated_live_test=$(date +%s%N)")
+          echo "service=${SERVICE_LABEL} checkout=${checkout_result}"
+          checkout_code=${checkout_result%% *}
+          checkout_url=${checkout_result#* }
+          test "$checkout_code" = '200'
+          echo "$checkout_url" | grep -Eq '/checkout|/checkouts/'
+          grep -Fq "$PRODUCT_FRAGMENT" "$CHECKOUT_BODY"
 
-            clear_code=$(curl --max-time 45 --connect-timeout 15 --retry 3 --retry-all-errors --retry-delay 2 -sS \
-              -c "$cookie" -b "$cookie" \
-              -o "$clear_body" -w '%{http_code}' \
-              -X POST "${STORE}/cart/clear.js" \
-              -H 'Accept: application/json')
-            echo "${service}: cart_clear_http=${clear_code}"
-            test "$clear_code" = '200'
-            grep -Eq '"item_count"[[:space:]]*:[[:space:]]*0' "$clear_body"
-          }
+          cleanup
+          grep -Eq '"item_count"[[:space:]]*:[[:space:]]*0' "$CLEAR_BODY"
+          trap - EXIT
 
-          test_service neuzulassung 51237294539018 'Neuzulassung' 12000
-          test_service umschreibung 53495252254986 'Umschreibung' 12000
-          test_service wiederzulassung 53495253041418 'Wiederzulassung' 12000
-          test_service adress-namens-aenderung 53495252910346 'Adress- oder Namensänderung' 4900
-
-      - name: Upload live-test evidence
+      - name: Upload service evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: live-shopify-order-test-20260811
+          name: live-service-${{ matrix.key }}-evidence
           path: |
-            /tmp/live-headers.txt
-            /tmp/live-static.html
-            /tmp/live-rendered.html
-            /tmp/*-cart-add.json
-            /tmp/*-cart.json
-            /tmp/*-checkout-headers.txt
-            /tmp/*-checkout.html
-            /tmp/*-cart-clear.json
-          if-no-files-found: error
+            /tmp/${{ matrix.key }}-cart-add.json
+            /tmp/${{ matrix.key }}-cart-add-headers.txt
+            /tmp/${{ matrix.key }}-checkout.html
+            /tmp/${{ matrix.key }}-checkout-headers.txt
+            /tmp/${{ matrix.key }}-cart-clear.json
+          if-no-files-found: warn
           retention-days: 1
