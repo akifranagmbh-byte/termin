@@ -10,15 +10,15 @@ permissions:
   contents: read
 
 jobs:
-  verify-live-homepage-and-checkout:
+  verify-all-live-services:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
-      - name: Open the newly published homepage and reach Shopify checkout
+      - name: Click every published Zulassung button and verify the Shopify checkout
         shell: bash
         run: |
           set -euo pipefail
-          OUT=/tmp/kfz-menu-live-test
+          OUT=/tmp/kfz-all-services-live-test
           mkdir -p "$OUT"
           cd "$OUT"
           npm init -y >/dev/null 2>&1
@@ -29,8 +29,42 @@ jobs:
           const puppeteer = require('puppeteer-core');
 
           const STORE = 'https://kennzeichen-krefeld.com';
-          const ORDER_PAGE = '/pages/zulassung-jetzt-bestellen';
-          const VARIANT = '51237294539018';
+          const EXPECTED_THEME_ID = 192983859466;
+          const services = [
+            {
+              key: 'neuzulassung',
+              title: 'Neuzulassung',
+              variant: '51237294539018',
+              button: 'Neuzulassung bestellen',
+              pricePattern: /120[,.]00|120\s*€/i,
+              expectedPrice: '120,00 EUR',
+            },
+            {
+              key: 'umschreibung',
+              title: 'Umschreibung',
+              variant: '53495252254986',
+              button: 'Umschreibung bestellen',
+              pricePattern: /120[,.]00|120\s*€/i,
+              expectedPrice: '120,00 EUR',
+            },
+            {
+              key: 'wiederzulassung',
+              title: 'Wiederzulassung',
+              variant: '53495253041418',
+              button: 'Wiederzulassung bestellen',
+              pricePattern: /120[,.]00|120\s*€/i,
+              expectedPrice: '120,00 EUR',
+            },
+            {
+              key: 'adress-namens-aenderung',
+              title: 'Adress- oder Namensänderung',
+              variant: '53495252910346',
+              button: 'Änderung bestellen',
+              pricePattern: /49[,.]00|49\s*€/i,
+              expectedPrice: '49,00 EUR',
+            },
+          ];
+
           const candidates = [
             '/usr/bin/google-chrome-stable',
             '/usr/bin/google-chrome',
@@ -43,55 +77,25 @@ jobs:
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           const isCheckout = (url) => /\/checkouts?\//.test(url) || url.includes('/checkout');
 
-          function browserOptions() {
-            return {
-              executablePath,
-              headless: false,
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--no-first-run',
-                '--no-default-browser-check',
-                '--window-size=1440,1100',
-              ],
-            };
-          }
-
-          async function newPage(context) {
+          async function testService(browser, service) {
+            const context = await browser.createBrowserContext();
             const page = await context.newPage();
             await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
             await page.setExtraHTTPHeaders({
               'Cache-Control': 'no-cache, no-store, max-age=0',
               Pragma: 'no-cache',
             });
-            return page;
-          }
-
-          async function readCheckout(page) {
-            await sleep(1200);
-            return page.evaluate(() => ({
-              url: location.href,
-              title: document.title,
-              text: document.body.innerText.slice(0, 10000),
-            }));
-          }
-
-          (async () => {
-            const browser = await puppeteer.launch(browserOptions());
-            const context = await browser.createBrowserContext();
-            const page = await newPage(context);
 
             try {
-              const response = await page.goto(`${STORE}/?published-emergency-test=${Date.now()}`, {
-                waitUntil: 'networkidle2',
-                timeout: 90000,
-              });
+              const response = await page.goto(
+                `${STORE}/?live-service-test=${service.key}-${Date.now()}`,
+                { waitUntil: 'networkidle2', timeout: 90000 }
+              );
               if (!response || !response.ok()) {
-                throw new Error(`Homepage failed: ${response ? response.status() : 'no response'}`);
+                throw new Error(`${service.title}: Homepage failed with ${response ? response.status() : 'no response'}`);
               }
 
-              const homepageState = await page.evaluate((variant, orderPage) => {
+              const state = await page.evaluate((variant) => {
                 const visible = (element) => {
                   if (!element) return false;
                   const style = getComputedStyle(element);
@@ -105,54 +109,53 @@ jobs:
                     rect.height > 0
                   );
                 };
-
                 const direct = document.querySelector('#kfz-direct-order-20260811');
-                const directForm = Array.from(document.querySelectorAll('#kfz-direct-order-20260811 form')).find(
-                  (form) => form.querySelector(`input[name="id"][value="${variant}"]`)
+                const form = Array.from(document.querySelectorAll('#kfz-direct-order-20260811 form')).find(
+                  (candidate) => candidate.querySelector(`input[name="id"][value="${variant}"]`)
                 );
                 const legacy = document.querySelector('#df-intake-form');
-                const menuLinks = Array.from(document.querySelectorAll('a')).filter((link) => {
-                  const href = link.getAttribute('href') || '';
-                  return (
-                    /JETZT\s+ZULASSUNG\s+BESTELLEN/i.test(link.textContent || '') ||
-                    href.includes(orderPage) ||
-                    href.includes('/bestellen')
-                  );
-                });
-                const visibleMenuLink = menuLinks.find(visible);
                 const bodyText = document.body.innerText || '';
-
                 return {
-                  url: location.href,
-                  title: document.title,
                   theme: window.Shopify?.theme || null,
-                  directExists: Boolean(direct),
                   directVisible: visible(direct),
-                  directHeading: direct?.querySelector('h2')?.textContent?.trim() || '',
-                  directFormExists: Boolean(directForm),
-                  directButtonText: directForm?.querySelector('button')?.textContent?.trim() || '',
+                  formExists: Boolean(form),
+                  buttonText: form?.querySelector('button[type="submit"]')?.textContent?.trim() || '',
+                  serviceProperty:
+                    form?.querySelector('input[name="properties[Zulassungsvorgang]"]')?.value || '',
+                  documentStatus:
+                    form?.querySelector('input[name="properties[Unterlagenstatus]"]')?.value || '',
+                  version:
+                    form?.querySelector('input[name="properties[Bestellablauf-Version]"]')?.value || '',
                   legacyExists: Boolean(legacy),
                   legacyVisible: visible(legacy),
-                  menuLinkCount: menuLinks.length,
-                  visibleMenuText: visibleMenuLink?.textContent?.trim() || '',
-                  visibleMenuHref: visibleMenuLink?.getAttribute('href') || '',
-                  oldFailureTextVisible: /Die sichere Übermittlung ist gerade nicht möglich/i.test(bodyText),
-                  oldWaitingTextVisible: /sichere Übermittlung.*nicht möglich/i.test(bodyText),
+                  oldErrorVisible: /sichere Übermittlung.*nicht möglich/i.test(bodyText),
                 };
-              }, VARIANT, ORDER_PAGE);
+              }, service.variant);
 
-              console.log(`[homepage] ${JSON.stringify(homepageState)}`);
-              fs.writeFileSync('homepage.json', JSON.stringify(homepageState, null, 2));
-              await page.screenshot({ path: 'homepage.png', fullPage: true });
+              console.log(`[${service.key}:homepage] ${JSON.stringify(state)}`);
+              fs.writeFileSync(`${service.key}-homepage.json`, JSON.stringify(state, null, 2));
+              await page.screenshot({ path: `${service.key}-homepage.png`, fullPage: true });
 
-              if (!homepageState.directExists || !homepageState.directVisible || !homepageState.directFormExists) {
-                throw new Error(`The published homepage does not show the direct emergency order form: ${JSON.stringify(homepageState)}`);
+              if (Number(state.theme?.id) !== EXPECTED_THEME_ID || state.theme?.role !== 'main') {
+                throw new Error(`${service.title}: Wrong live theme ${JSON.stringify(state.theme)}`);
               }
-              if (homepageState.legacyVisible) {
-                throw new Error(`The broken legacy upload form is still visible: ${JSON.stringify(homepageState)}`);
+              if (!state.directVisible || !state.formExists) {
+                throw new Error(`${service.title}: Direct order form is not visible`);
               }
-              if (homepageState.oldFailureTextVisible || homepageState.oldWaitingTextVisible) {
-                throw new Error(`The old transmission error is still visible: ${JSON.stringify(homepageState)}`);
+              if (state.buttonText !== service.button) {
+                throw new Error(`${service.title}: Wrong button text ${state.buttonText}`);
+              }
+              if (state.serviceProperty !== service.title) {
+                throw new Error(`${service.title}: Wrong service property ${state.serviceProperty}`);
+              }
+              if (!/Geschützter Upload-Link nach Bestellung erforderlich/i.test(state.documentStatus)) {
+                throw new Error(`${service.title}: Wrong document status ${state.documentStatus}`);
+              }
+              if (state.version !== '2026-08-11.5-server') {
+                throw new Error(`${service.title}: Wrong flow version ${state.version}`);
+              }
+              if (state.legacyVisible || state.oldErrorVisible) {
+                throw new Error(`${service.title}: Broken upload flow or error text is still visible`);
               }
 
               const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -160,44 +163,73 @@ jobs:
                 const form = Array.from(document.querySelectorAll('#kfz-direct-order-20260811 form')).find(
                   (candidate) => candidate.querySelector(`input[name="id"][value="${variant}"]`)
                 );
-                if (!form) throw new Error('Neuzulassung form not found');
-                const button = form.querySelector('button[type="submit"]');
-                if (!button) throw new Error('Neuzulassung submit button not found');
+                const button = form?.querySelector('button[type="submit"]');
+                if (!button) throw new Error('Submit button not found');
                 button.click();
-              }, VARIANT);
+              }, service.variant);
               await navigation;
+              await sleep(1200);
 
-              const checkoutState = await readCheckout(page);
-              console.log(`[homepage-checkout] ${JSON.stringify({ url: checkoutState.url, title: checkoutState.title })}`);
-              fs.writeFileSync('homepage-checkout.json', JSON.stringify(checkoutState, null, 2));
-              await page.screenshot({ path: 'homepage-checkout.png', fullPage: false });
+              const checkout = await page.evaluate(() => ({
+                url: location.href,
+                title: document.title,
+                text: document.body.innerText.slice(0, 12000),
+              }));
+              console.log(`[${service.key}:checkout] ${JSON.stringify({ url: checkout.url, title: checkout.title })}`);
+              fs.writeFileSync(`${service.key}-checkout.json`, JSON.stringify(checkout, null, 2));
+              await page.screenshot({ path: `${service.key}-checkout.png`, fullPage: false });
 
-              if (!isCheckout(checkoutState.url)) {
-                throw new Error(`Homepage order button did not reach checkout: ${checkoutState.url}`);
+              if (!isCheckout(checkout.url)) {
+                throw new Error(`${service.title}: Checkout not reached: ${checkout.url}`);
               }
-              if (!/KFZ Anmeldung|Neuzulassung/i.test(checkoutState.text)) {
-                throw new Error('Expected Zulassung product not visible in checkout');
+              if (!/KFZ Anmeldung/i.test(checkout.text)) {
+                throw new Error(`${service.title}: KFZ Anmeldung is missing in checkout`);
               }
-              if (!/120[,.]00|120\s*€/i.test(checkoutState.text)) {
-                throw new Error('Expected 120 EUR price not visible in checkout');
+              if (!service.pricePattern.test(checkout.text)) {
+                throw new Error(`${service.title}: Expected ${service.expectedPrice} is missing in checkout`);
               }
 
-              const result = {
-                passed: true,
-                liveTheme: homepageState.theme,
-                homepageDirectForm: true,
-                brokenLegacyFormVisible: false,
+              return {
+                service: service.title,
+                variant: service.variant,
+                price: service.expectedPrice,
+                checkoutReached: true,
                 oldErrorVisible: false,
-                menuLinkVisible: Boolean(homepageState.visibleMenuText),
-                menuText: homepageState.visibleMenuText,
-                checkoutUrl: checkoutState.url,
-                product: 'KFZ Anmeldung / Neuzulassung',
-                price: '120,00 EUR',
                 orderCompleted: false,
                 paymentSubmitted: false,
               };
-              fs.writeFileSync('result.json', JSON.stringify(result, null, 2));
-              console.log(`[success] ${JSON.stringify(result)}`);
+            } finally {
+              await context.close();
+            }
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath,
+              headless: false,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--window-size=1440,1100',
+              ],
+            });
+
+            try {
+              const results = [];
+              for (const service of services) {
+                results.push(await testService(browser, service));
+              }
+              const summary = {
+                passed: true,
+                testedAt: new Date().toISOString(),
+                liveThemeId: EXPECTED_THEME_ID,
+                services: results,
+              };
+              fs.writeFileSync('result.json', JSON.stringify(summary, null, 2));
+              console.log(`[success] ${JSON.stringify(summary)}`);
             } finally {
               await browser.close();
             }
@@ -213,7 +245,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emergency-menu-live-test
-          path: /tmp/kfz-menu-live-test
+          name: all-live-zulassung-services-test
+          path: /tmp/kfz-all-services-live-test
           if-no-files-found: error
           retention-days: 1
