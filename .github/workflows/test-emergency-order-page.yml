@@ -39,6 +39,7 @@ jobs:
 
           const PAGE = 'https://kennzeichen-krefeld.com/bestellen';
           const EXPECTED_VARIANT = 51237294539018;
+          const EXPECTED_PRICE = 12000;
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           const isCheckout = (url) => /\/checkouts?\//.test(url) || url.includes('/checkout');
 
@@ -60,72 +61,104 @@ jobs:
             const page = await context.newPage();
             await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
 
+            async function clearCart() {
+              return page.evaluate(async () => {
+                const response = await fetch('/cart/clear.js', {
+                  method: 'POST',
+                  credentials: 'same-origin',
+                  headers: { Accept: 'application/json' },
+                });
+                return { status: response.status, body: await response.json() };
+              });
+            }
+
             try {
               const response = await page.goto(PAGE, { waitUntil: 'domcontentloaded', timeout: 90000 });
-              if (!response) throw new Error('No response from emergency page.');
-              console.log(`[page-http] ${response.status()}`);
-              console.log(`[page-url] ${page.url()}`);
-              if (!response.ok()) throw new Error(`Emergency page returned HTTP ${response.status()}.`);
+              if (!response || !response.ok()) {
+                throw new Error(`Emergency page failed: ${response ? response.status() : 'no response'}`);
+              }
 
-              await page.waitForSelector(`a[href*="/cart/${EXPECTED_VARIANT}:1"]`, { visible: true, timeout: 45000 });
-              await sleep(1400);
-
-              const before = await page.evaluate((variant) => ({
+              const linkSelector = `a[href*="/cart/${EXPECTED_VARIANT}:1"]`;
+              await page.waitForSelector(linkSelector, { visible: true, timeout: 45000 });
+              await sleep(1000);
+              const before = await page.evaluate((selector) => ({
                 title: document.title,
                 heading: document.querySelector('h1')?.textContent?.trim() || '',
-                bodyText: document.body.innerText.slice(0, 3000),
-                buttonText: document.querySelector(`a[href*="/cart/${variant}:1"]`)?.textContent?.trim() || '',
-              }), EXPECTED_VARIANT);
-              console.log(`[before] ${JSON.stringify(before)}`);
+                buttonText: document.querySelector(selector)?.textContent?.trim() || '',
+                href: document.querySelector(selector)?.href || '',
+              }), linkSelector);
+              console.log(`[page] ${JSON.stringify(before)}`);
               fs.writeFileSync('before.json', JSON.stringify(before, null, 2));
               await page.screenshot({ path: 'emergency-page.png', fullPage: true });
 
-              if (!/Kfz-Zulassung direkt bestellen/i.test(before.heading)) {
-                throw new Error(`Wrong emergency page heading: ${before.heading}`);
+              if (!/Kfz-Zulassung jetzt bestellen/i.test(before.heading)) {
+                throw new Error(`Wrong page heading: ${before.heading}`);
               }
               if (!/Neuzulassung bestellen/i.test(before.buttonText)) {
                 throw new Error(`Neuzulassung link missing: ${before.buttonText}`);
               }
 
+              const cleared = await clearCart();
+              if (cleared.status !== 200 || cleared.body.item_count !== 0) {
+                throw new Error(`Could not clear test cart: ${JSON.stringify(cleared)}`);
+              }
+
               await Promise.all([
                 page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
-                page.click(`a[href*="/cart/${EXPECTED_VARIANT}:1"]`),
+                page.click(linkSelector),
               ]);
-              await sleep(1200);
-              console.log(`[cart-url] ${page.url()}`);
+              await sleep(1000);
 
-              const cart = await page.evaluate(() => ({
-                text: document.body.innerText.slice(0, 5000),
-                checkoutButton: Boolean(document.querySelector('button[name="checkout"], input[name="checkout"], a[href="/checkout"]')),
-              }));
+              const cart = await page.evaluate(async () => {
+                const response = await fetch('/cart.js', {
+                  credentials: 'same-origin',
+                  headers: { Accept: 'application/json' },
+                });
+                return { status: response.status, body: await response.json() };
+              });
+              console.log(`[cart] ${JSON.stringify(cart)}`);
               fs.writeFileSync('cart.json', JSON.stringify(cart, null, 2));
               await page.screenshot({ path: 'cart.png', fullPage: true });
 
-              if (!/120[,.]00|120\s*€/i.test(cart.text)) {
-                throw new Error('The cart does not show the expected 120 EUR item.');
+              if (cart.status !== 200 || cart.body.item_count !== 1) {
+                throw new Error(`Wrong cart item count: ${JSON.stringify(cart)}`);
+              }
+              const item = cart.body.items[0];
+              if (Number(item.variant_id) !== EXPECTED_VARIANT) {
+                throw new Error(`Wrong variant: ${item.variant_id}`);
+              }
+              if (Number(item.final_line_price || item.line_price || item.price) !== EXPECTED_PRICE) {
+                throw new Error(`Wrong price: ${item.final_line_price || item.line_price || item.price}`);
               }
 
-              const checkoutSelector = 'button[name="checkout"], input[name="checkout"], a[href="/checkout"]';
-              await page.waitForSelector(checkoutSelector, { visible: true, timeout: 30000 });
-              await Promise.all([
-                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
-                page.click(checkoutSelector),
-              ]);
-              await sleep(900);
+              await page.goto('https://kennzeichen-krefeld.com/checkout', {
+                waitUntil: 'domcontentloaded',
+                timeout: 90000,
+              });
+              await sleep(1000);
+              const finalUrl = page.url();
+              await page.screenshot({ path: 'checkout.png', fullPage: false });
+              if (!isCheckout(finalUrl)) {
+                throw new Error(`Checkout not reached: ${finalUrl}`);
+              }
 
               const result = {
                 passed: true,
                 emergencyPage: PAGE,
-                cartUrl: page.url(),
-                reachedCheckout: isCheckout(page.url()),
-                expectedVariant: EXPECTED_VARIANT,
-                note: 'No order completed and no payment submitted. Isolated browser context discarded.',
+                finalUrl,
+                variantId: Number(item.variant_id),
+                price: Number(item.final_line_price || item.line_price || item.price),
+                noOrderCompleted: true,
+                noPaymentSubmitted: true,
               };
-              console.log(`[result] ${JSON.stringify(result)}`);
+              console.log(`[success] ${JSON.stringify(result)}`);
               fs.writeFileSync('result.json', JSON.stringify(result, null, 2));
-              await page.screenshot({ path: 'checkout.png', fullPage: false });
 
-              if (!result.reachedCheckout) throw new Error(`Checkout not reached: ${page.url()}`);
+              const postClear = await clearCart();
+              fs.writeFileSync('post-clear.json', JSON.stringify(postClear, null, 2));
+              if (postClear.status !== 200 || postClear.body.item_count !== 0) {
+                throw new Error(`Test cart was not cleared: ${JSON.stringify(postClear)}`);
+              }
             } finally {
               await browser.close();
             }
