@@ -10,11 +10,11 @@ permissions:
   contents: read
 
 jobs:
-  verify-live-menu-and-checkout:
+  verify-live-homepage-and-checkout:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Open the public homepage, use the emergency menu link and reach Shopify checkout
+      - name: Open the newly published homepage and reach Shopify checkout
         shell: bash
         run: |
           set -euo pipefail
@@ -37,14 +37,14 @@ jobs:
             '/usr/bin/chromium',
             '/usr/bin/chromium-browser',
           ];
-          const executablePath = candidates.find((p) => fs.existsSync(p));
+          const executablePath = candidates.find((path) => fs.existsSync(path));
           if (!executablePath) throw new Error('Chrome/Chromium not found');
 
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           const isCheckout = (url) => /\/checkouts?\//.test(url) || url.includes('/checkout');
 
-          (async () => {
-            const browser = await puppeteer.launch({
+          function browserOptions() {
+            return {
               executablePath,
               headless: false,
               args: [
@@ -55,17 +55,35 @@ jobs:
                 '--no-default-browser-check',
                 '--window-size=1440,1100',
               ],
-            });
-            const context = await browser.createBrowserContext();
+            };
+          }
+
+          async function newPage(context) {
             const page = await context.newPage();
             await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
             await page.setExtraHTTPHeaders({
               'Cache-Control': 'no-cache, no-store, max-age=0',
               Pragma: 'no-cache',
             });
+            return page;
+          }
+
+          async function readCheckout(page) {
+            await sleep(1200);
+            return page.evaluate(() => ({
+              url: location.href,
+              title: document.title,
+              text: document.body.innerText.slice(0, 10000),
+            }));
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch(browserOptions());
+            const context = await browser.createBrowserContext();
+            const page = await newPage(context);
 
             try {
-              const response = await page.goto(`${STORE}/?menu-live-test=${Date.now()}`, {
+              const response = await page.goto(`${STORE}/?published-emergency-test=${Date.now()}`, {
                 waitUntil: 'networkidle2',
                 timeout: 90000,
               });
@@ -73,68 +91,89 @@ jobs:
                 throw new Error(`Homepage failed: ${response ? response.status() : 'no response'}`);
               }
 
-              const menuSelector = `a[href="${ORDER_PAGE}"]`;
-              await page.waitForSelector(menuSelector, { visible: true, timeout: 45000 });
-              const menuState = await page.evaluate((selector) => {
-                const links = Array.from(document.querySelectorAll(selector));
-                const visible = links.find((link) => {
-                  const style = getComputedStyle(link);
-                  const rect = link.getBoundingClientRect();
-                  return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                });
-                return {
-                  title: document.title,
-                  linkCount: links.length,
-                  visibleText: visible?.textContent?.trim() || '',
-                  visibleHref: visible?.getAttribute('href') || '',
+              const homepageState = await page.evaluate((variant, orderPage) => {
+                const visible = (element) => {
+                  if (!element) return false;
+                  const style = getComputedStyle(element);
+                  const rect = element.getBoundingClientRect();
+                  return (
+                    !element.hidden &&
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    Number(style.opacity || '1') > 0 &&
+                    rect.width > 0 &&
+                    rect.height > 0
+                  );
                 };
-              }, menuSelector);
-              console.log(`[homepage-menu] ${JSON.stringify(menuState)}`);
-              fs.writeFileSync('homepage-menu.json', JSON.stringify(menuState, null, 2));
-              await page.screenshot({ path: 'homepage-menu.png', fullPage: false });
 
-              if (!/JETZT ZULASSUNG BESTELLEN/i.test(menuState.visibleText)) {
-                throw new Error(`Emergency menu link is not visibly active: ${JSON.stringify(menuState)}`);
+                const direct = document.querySelector('#kfz-direct-order-20260811');
+                const directForm = Array.from(document.querySelectorAll('#kfz-direct-order-20260811 form')).find(
+                  (form) => form.querySelector(`input[name="id"][value="${variant}"]`)
+                );
+                const legacy = document.querySelector('#df-intake-form');
+                const menuLinks = Array.from(document.querySelectorAll('a')).filter((link) => {
+                  const href = link.getAttribute('href') || '';
+                  return (
+                    /JETZT\s+ZULASSUNG\s+BESTELLEN/i.test(link.textContent || '') ||
+                    href.includes(orderPage) ||
+                    href.includes('/bestellen')
+                  );
+                });
+                const visibleMenuLink = menuLinks.find(visible);
+                const bodyText = document.body.innerText || '';
+
+                return {
+                  url: location.href,
+                  title: document.title,
+                  theme: window.Shopify?.theme || null,
+                  directExists: Boolean(direct),
+                  directVisible: visible(direct),
+                  directHeading: direct?.querySelector('h2')?.textContent?.trim() || '',
+                  directFormExists: Boolean(directForm),
+                  directButtonText: directForm?.querySelector('button')?.textContent?.trim() || '',
+                  legacyExists: Boolean(legacy),
+                  legacyVisible: visible(legacy),
+                  menuLinkCount: menuLinks.length,
+                  visibleMenuText: visibleMenuLink?.textContent?.trim() || '',
+                  visibleMenuHref: visibleMenuLink?.getAttribute('href') || '',
+                  oldFailureTextVisible: /Die sichere Übermittlung ist gerade nicht möglich/i.test(bodyText),
+                  oldWaitingTextVisible: /sichere Übermittlung.*nicht möglich/i.test(bodyText),
+                };
+              }, VARIANT, ORDER_PAGE);
+
+              console.log(`[homepage] ${JSON.stringify(homepageState)}`);
+              fs.writeFileSync('homepage.json', JSON.stringify(homepageState, null, 2));
+              await page.screenshot({ path: 'homepage.png', fullPage: true });
+
+              if (!homepageState.directExists || !homepageState.directVisible || !homepageState.directFormExists) {
+                throw new Error(`The published homepage does not show the direct emergency order form: ${JSON.stringify(homepageState)}`);
+              }
+              if (homepageState.legacyVisible) {
+                throw new Error(`The broken legacy upload form is still visible: ${JSON.stringify(homepageState)}`);
+              }
+              if (homepageState.oldFailureTextVisible || homepageState.oldWaitingTextVisible) {
+                throw new Error(`The old transmission error is still visible: ${JSON.stringify(homepageState)}`);
               }
 
-              await Promise.all([
-                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
-                page.click(menuSelector),
-              ]);
-              await sleep(900);
+              const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
+              await page.evaluate((variant) => {
+                const form = Array.from(document.querySelectorAll('#kfz-direct-order-20260811 form')).find(
+                  (candidate) => candidate.querySelector(`input[name="id"][value="${variant}"]`)
+                );
+                if (!form) throw new Error('Neuzulassung form not found');
+                const button = form.querySelector('button[type="submit"]');
+                if (!button) throw new Error('Neuzulassung submit button not found');
+                button.click();
+              }, VARIANT);
+              await navigation;
 
-              const orderPageState = await page.evaluate(() => ({
-                url: location.href,
-                heading: document.querySelector('h1')?.textContent?.trim() || '',
-                text: document.body.innerText.slice(0, 3000),
-              }));
-              console.log(`[order-page] ${JSON.stringify(orderPageState)}`);
-              fs.writeFileSync('order-page.json', JSON.stringify(orderPageState, null, 2));
-              await page.screenshot({ path: 'order-page.png', fullPage: true });
-
-              if (!/Kfz-Zulassung jetzt bestellen/i.test(orderPageState.heading)) {
-                throw new Error(`Wrong order page: ${JSON.stringify(orderPageState)}`);
-              }
-
-              const orderSelector = `a[href*="/cart/${VARIANT}:1"]`;
-              await page.waitForSelector(orderSelector, { visible: true, timeout: 30000 });
-              await Promise.all([
-                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
-                page.click(orderSelector),
-              ]);
-              await sleep(1200);
-
-              const checkoutState = await page.evaluate(() => ({
-                url: location.href,
-                title: document.title,
-                text: document.body.innerText.slice(0, 9000),
-              }));
-              console.log(`[checkout] ${JSON.stringify({ url: checkoutState.url, title: checkoutState.title })}`);
-              fs.writeFileSync('checkout.json', JSON.stringify(checkoutState, null, 2));
-              await page.screenshot({ path: 'checkout.png', fullPage: false });
+              const checkoutState = await readCheckout(page);
+              console.log(`[homepage-checkout] ${JSON.stringify({ url: checkoutState.url, title: checkoutState.title })}`);
+              fs.writeFileSync('homepage-checkout.json', JSON.stringify(checkoutState, null, 2));
+              await page.screenshot({ path: 'homepage-checkout.png', fullPage: false });
 
               if (!isCheckout(checkoutState.url)) {
-                throw new Error(`Checkout not reached: ${checkoutState.url}`);
+                throw new Error(`Homepage order button did not reach checkout: ${checkoutState.url}`);
               }
               if (!/KFZ Anmeldung|Neuzulassung/i.test(checkoutState.text)) {
                 throw new Error('Expected Zulassung product not visible in checkout');
@@ -145,9 +184,12 @@ jobs:
 
               const result = {
                 passed: true,
-                homepage: STORE,
-                menuText: menuState.visibleText,
-                orderPage: orderPageState.url,
+                liveTheme: homepageState.theme,
+                homepageDirectForm: true,
+                brokenLegacyFormVisible: false,
+                oldErrorVisible: false,
+                menuLinkVisible: Boolean(homepageState.visibleMenuText),
+                menuText: homepageState.visibleMenuText,
                 checkoutUrl: checkoutState.url,
                 product: 'KFZ Anmeldung / Neuzulassung',
                 price: '120,00 EUR',
