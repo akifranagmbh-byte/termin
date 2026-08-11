@@ -1,0 +1,79 @@
+name: Diagnose Azure endpoints
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/endpoint-diagnostics.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe DNS, CORS and HTTP responses
+        shell: bash
+        run: |
+          set +e
+
+          OLD_HOST="fn-kennzeichen-umwelt-prod-e9dkdqhudseng9f2.germanywestcentral-01.azurewebsites.net"
+          NEW_HOST="fn-kfz-zulassung-prod-260810-czaxc8chcze9eufb.germanywestcentral-01.azurewebsites.net"
+          OLD_INTAKE="https://${OLD_HOST}/api/zulassung/intake"
+          OLD_ADMIN="https://${OLD_HOST}/api/zulassung/admin"
+          NEW_INTAKE="https://${NEW_HOST}/api/precheckout/intake"
+
+          echo '=== DNS OLD ==='
+          getent ahosts "$OLD_HOST" || true
+          echo '=== DNS NEW ==='
+          getent ahosts "$NEW_HOST" || true
+
+          probe() {
+            label="$1"
+            shift
+            rm -f /tmp/probe-headers /tmp/probe-body
+            echo
+            echo "=== ${label} ==="
+            code=$(curl --max-time 30 --connect-timeout 10 -sS \
+              -D /tmp/probe-headers \
+              -o /tmp/probe-body \
+              -w '%{http_code}' \
+              "$@")
+            rc=$?
+            echo "curl_exit=${rc} http_status=${code}"
+            echo '-- headers --'
+            sed -n '1,80p' /tmp/probe-headers 2>/dev/null || true
+            echo '-- body --'
+            head -c 2000 /tmp/probe-body 2>/dev/null || true
+            echo
+          }
+
+          probe 'OLD ADMIN GET' "$OLD_ADMIN"
+
+          probe 'OLD INTAKE OPTIONS' \
+            -X OPTIONS "$OLD_INTAKE" \
+            -H 'Origin: https://kennzeichen-krefeld.com' \
+            -H 'Access-Control-Request-Method: POST' \
+            -H 'Access-Control-Request-Headers: content-type'
+
+          probe 'OLD INTAKE EMPTY POST' \
+            -X POST "$OLD_INTAKE" \
+            -H 'Origin: https://kennzeichen-krefeld.com' \
+            -H 'Accept: application/json' \
+            -H 'Content-Type: application/json' \
+            --data '{}'
+
+          probe 'NEW INTAKE OPTIONS' \
+            -X OPTIONS "$NEW_INTAKE" \
+            -H 'Origin: https://kennzeichen-krefeld.com' \
+            -H 'Access-Control-Request-Method: POST' \
+            -H 'Access-Control-Request-Headers: content-type'
+
+          probe 'NEW INTAKE EMPTY POST' \
+            -X POST "$NEW_INTAKE" \
+            -H 'Origin: https://kennzeichen-krefeld.com' \
+            -H 'Accept: application/json' \
+            -H 'Content-Type: application/json' \
+            --data '{}'
