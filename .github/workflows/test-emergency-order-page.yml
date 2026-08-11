@@ -89,58 +89,58 @@ jobs:
 
               const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
               await page.click(linkSelector);
-              const cartNavigation = await navigation;
+              const targetNavigation = await navigation;
               await sleep(1200);
 
-              const cartUrl = page.url();
-              const cartStatus = cartNavigation ? cartNavigation.status() : null;
-              const cartState = await page.evaluate(() => ({
+              let targetUrl = page.url();
+              let targetStatus = targetNavigation ? targetNavigation.status() : null;
+              let targetState = await page.evaluate(() => ({
                 title: document.title,
-                text: document.body.innerText.slice(0, 6000),
+                text: document.body.innerText.slice(0, 8000),
                 checkoutSelector: [
                   'button[name="checkout"]',
                   'input[name="checkout"]',
                   'a[href="/checkout"]',
                 ].find((selector) => document.querySelector(selector)) || '',
               }));
-              console.log(`[cart] ${JSON.stringify({ cartUrl, cartStatus, cartState })}`);
-              fs.writeFileSync('cart.json', JSON.stringify({ cartUrl, cartStatus, cartState }, null, 2));
-              await page.screenshot({ path: 'cart.png', fullPage: true });
+              console.log(`[target] ${JSON.stringify({ targetUrl, targetStatus, targetState })}`);
+              fs.writeFileSync('target.json', JSON.stringify({ targetUrl, targetStatus, targetState }, null, 2));
+              await page.screenshot({ path: 'target.png', fullPage: true });
 
-              if (cartStatus === 429 || /Verifying your connection/i.test(cartState.title + ' ' + cartState.text)) {
+              if (targetStatus === 429 || /Verifying your connection/i.test(targetState.title + ' ' + targetState.text)) {
                 throw new Error('Shopify anti-bot verification blocked the test browser.');
               }
-              if (!/KFZ Anmeldung|Neuzulassung/i.test(cartState.text)) {
-                throw new Error('The expected Zulassung item is not visible in the cart.');
+              if (!/KFZ Anmeldung|Neuzulassung/i.test(targetState.text)) {
+                throw new Error('The expected Zulassung item is not visible after clicking the order link.');
               }
-              if (!/120[,.]00|120\s*€/i.test(cartState.text)) {
-                throw new Error('The expected 120 EUR price is not visible in the cart.');
-              }
-              if (!cartState.checkoutSelector) {
-                throw new Error('No checkout button found after adding Neuzulassung.');
+              if (!/120[,.]00|120\s*€/i.test(targetState.text)) {
+                throw new Error('The expected 120 EUR price is not visible after clicking the order link.');
               }
 
-              const checkoutNavigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
-              await page.click(cartState.checkoutSelector);
-              await checkoutNavigation;
-              await sleep(1000);
+              if (!isCheckout(targetUrl)) {
+                if (!targetState.checkoutSelector) {
+                  throw new Error('Neither checkout nor a checkout button was reached.');
+                }
+                const checkoutNavigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
+                await page.click(targetState.checkoutSelector);
+                await checkoutNavigation;
+                await sleep(1000);
+                targetUrl = page.url();
+                if (!isCheckout(targetUrl)) {
+                  throw new Error(`Checkout not reached: ${targetUrl}`);
+                }
+              }
 
-              const finalUrl = page.url();
               await page.screenshot({ path: 'checkout.png', fullPage: false });
-              if (!isCheckout(finalUrl)) {
-                throw new Error(`Checkout not reached: ${finalUrl}`);
-              }
-
               const result = {
                 passed: true,
                 emergencyPage: PAGE,
-                cartUrl,
-                checkoutUrl: finalUrl,
+                checkoutUrl: targetUrl,
                 variantId: EXPECTED_VARIANT,
                 expectedPriceCents: 12000,
                 noOrderCompleted: true,
                 noPaymentSubmitted: true,
-                note: 'The isolated browser context, including its test cart, is discarded when Chrome closes.',
+                note: 'The isolated browser context, including its test checkout, is discarded when Chrome closes.',
               };
               console.log(`[success] ${JSON.stringify(result)}`);
               fs.writeFileSync('result.json', JSON.stringify(result, null, 2));
