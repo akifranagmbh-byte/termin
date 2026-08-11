@@ -1,0 +1,307 @@
+name: Test live published Shopify order flow
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/live-published-order-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-service-test:
+    name: Live – ${{ matrix.title }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - service: neuzulassung
+            variant: 51237294539018
+            price: 12000
+            title: Neuzulassung
+          - service: umschreibung
+            variant: 53495252254986
+            price: 12000
+            title: Umschreibung
+          - service: wiederzulassung
+            variant: 53495253041418
+            price: 12000
+            title: Wiederzulassung
+          - service: adress-namens-aenderung
+            variant: 53495252910346
+            price: 4900
+            title: Adress- oder Namensänderung
+
+    steps:
+      - name: Open the public site in Chrome and click the real order button
+        shell: bash
+        env:
+          SERVICE: ${{ matrix.service }}
+          EXPECTED_VARIANT: ${{ matrix.variant }}
+          EXPECTED_PRICE: ${{ matrix.price }}
+          EXPECTED_TITLE: ${{ matrix.title }}
+        run: |
+          set -euo pipefail
+          WORK="/tmp/live-published-${SERVICE}"
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          npm init -y >/dev/null 2>&1
+          npm install puppeteer-core@24.16.0 --no-audit --no-fund >/dev/null
+
+          cat > test.js <<'NODE'
+          const fs = require('fs');
+          const puppeteer = require('puppeteer-core');
+
+          const STORE = 'https://kennzeichen-krefeld.com';
+          const EXPECTED_THEME_ID = 192982286602;
+          const EXPECTED_VERSION = '2026-08-11.4';
+          const service = process.env.SERVICE;
+          const expectedVariant = Number(process.env.EXPECTED_VARIANT);
+          const expectedPrice = Number(process.env.EXPECTED_PRICE);
+          const expectedTitle = process.env.EXPECTED_TITLE;
+
+          const browserCandidates = [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+          ];
+          const executablePath = browserCandidates.find((path) => fs.existsSync(path));
+          if (!executablePath) throw new Error('Chrome/Chromium not found.');
+
+          const isCheckoutUrl = (url) => /\/checkouts?\//.test(url) || url.includes('/checkout');
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          async function clearCart(context) {
+            const page = await context.newPage();
+            try {
+              await page.goto(`${STORE}/cart?clear-test=${Date.now()}`, {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000,
+              });
+              return await page.evaluate(async () => {
+                const response = await fetch('/cart/clear.js', {
+                  method: 'POST',
+                  credentials: 'same-origin',
+                  headers: { Accept: 'application/json' },
+                });
+                const text = await response.text();
+                let data = {};
+                try { data = JSON.parse(text); } catch (_) {}
+                return { status: response.status, itemCount: data.item_count, text: text.slice(0, 1000) };
+              });
+            } finally {
+              await page.close();
+            }
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath,
+              headless: true,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
+                '--no-first-run',
+                '--no-default-browser-check',
+              ],
+            });
+
+            const context = await browser.createBrowserContext();
+            const page = await context.newPage();
+            await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
+            await page.setUserAgent(
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+              '(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+            );
+            await page.setExtraHTTPHeaders({
+              'Cache-Control': 'no-cache, no-store, max-age=0',
+              Pragma: 'no-cache',
+            });
+
+            const legacyUploadRequests = [];
+            const pageErrors = [];
+            page.on('request', (request) => {
+              if (request.url().includes('/api/precheckout/intake')) {
+                legacyUploadRequests.push({ method: request.method(), url: request.url() });
+              }
+            });
+            page.on('pageerror', (error) => {
+              pageErrors.push(String(error.stack || error.message || error));
+            });
+            page.on('console', (message) => {
+              if (message.type() === 'error') {
+                console.log(`[browser-console-error] ${message.text()}`);
+              }
+            });
+
+            try {
+              const preClear = await clearCart(context);
+              console.log(`[pre-clear] ${JSON.stringify(preClear)}`);
+              if (preClear.status !== 200 || preClear.itemCount !== 0) {
+                throw new Error(`Could not start with an empty cart: ${JSON.stringify(preClear)}`);
+              }
+
+              const publicUrl = `${STORE}/?live-published-test=${service}-${Date.now()}`;
+              await page.goto(publicUrl, { waitUntil: 'networkidle2', timeout: 90000 });
+              await page.waitForSelector('#kfz-fixed-order-form', { visible: true, timeout: 30000 });
+              await sleep(1200);
+
+              const before = await page.evaluate(() => {
+                const visible = (element) => {
+                  if (!element) return false;
+                  const style = getComputedStyle(element);
+                  const rect = element.getBoundingClientRect();
+                  return (
+                    !element.hidden &&
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    rect.width > 0 &&
+                    rect.height > 0
+                  );
+                };
+                const section = document.querySelector('#secure-ikfz');
+                const fixed = document.querySelector('#kfz-fixed-order-form');
+                const legacy = document.querySelector('#df-intake-form');
+                const prep = document.querySelector('#secure-ikfz .df-prep');
+                return {
+                  url: location.href,
+                  title: document.title,
+                  theme: window.Shopify?.theme || null,
+                  repairVersion: document.documentElement.getAttribute('data-kfz-order-fix'),
+                  heading: section?.querySelector('h2')?.textContent?.trim() || '',
+                  buttonText: fixed?.querySelector('button[type="submit"]')?.textContent?.trim() || '',
+                  fixedExists: Boolean(fixed),
+                  fixedVisible: visible(fixed),
+                  legacyExists: Boolean(legacy),
+                  legacyVisible: visible(legacy),
+                  prepExists: Boolean(prep),
+                  prepVisible: visible(prep),
+                  oldFailureTextPresent: /sichere übermittlung ist gerade nicht/i.test(section?.innerText || ''),
+                };
+              });
+
+              console.log(`[before] ${JSON.stringify(before)}`);
+              fs.writeFileSync('before.json', JSON.stringify(before, null, 2));
+              await page.screenshot({ path: 'before-click.png', fullPage: false });
+
+              if (Number(before.theme?.id) !== EXPECTED_THEME_ID) {
+                throw new Error(`Wrong live theme: ${JSON.stringify(before.theme)}`);
+              }
+              if (before.repairVersion !== EXPECTED_VERSION) {
+                throw new Error(`Wrong order-flow version: ${before.repairVersion}`);
+              }
+              if (!before.fixedExists || !before.fixedVisible) {
+                throw new Error('The repaired order form is not visibly active.');
+              }
+              if (before.legacyExists || before.legacyVisible || before.prepExists || before.prepVisible) {
+                throw new Error(`The legacy upload flow is still present: ${JSON.stringify(before)}`);
+              }
+              if (before.oldFailureTextPresent) {
+                throw new Error('The old secure-transmission error text is still present.');
+              }
+
+              await page.select('#kfz-fixed-order-form select[name="service"]', service);
+              await page.click('#kfz-fixed-order-form input[name="privacyAccepted"]');
+
+              const cartResponsePromise = page.waitForResponse(
+                (response) => response.url().includes('/cart/add.js') && response.request().method() === 'POST',
+                { timeout: 45000 }
+              );
+              const navigationPromise = page.waitForNavigation({
+                waitUntil: 'domcontentloaded',
+                timeout: 60000,
+              });
+
+              await page.click('#kfz-fixed-order-form button[type="submit"]');
+              const cartResponse = await cartResponsePromise;
+              const cartText = await cartResponse.text();
+              await navigationPromise;
+              await sleep(700);
+
+              const finalUrl = page.url();
+              console.log(`[checkout] ${finalUrl}`);
+              console.log(`[cart-add] status=${cartResponse.status()} body=${cartText.slice(0, 1500)}`);
+
+              if (!isCheckoutUrl(finalUrl)) {
+                throw new Error(`Checkout was not reached: ${finalUrl}`);
+              }
+              if (cartResponse.status() !== 200) {
+                throw new Error(`Cart add returned HTTP ${cartResponse.status()}: ${cartText}`);
+              }
+              if (legacyUploadRequests.length !== 0) {
+                throw new Error(`The broken Azure upload was called: ${JSON.stringify(legacyUploadRequests)}`);
+              }
+              if (pageErrors.some((entry) => entry.includes('precheckout/intake'))) {
+                throw new Error(`Legacy upload JavaScript error detected: ${JSON.stringify(pageErrors)}`);
+              }
+
+              const parsed = JSON.parse(cartText);
+              const item = Array.isArray(parsed.items) ? parsed.items[0] : parsed;
+              const actualVariant = Number(item.variant_id || item.id);
+              const actualPrice = Number(item.final_line_price || item.line_price || item.price);
+              const properties = item.properties || {};
+
+              if (actualVariant !== expectedVariant) {
+                throw new Error(`Wrong variant: expected ${expectedVariant}, got ${actualVariant}`);
+              }
+              if (actualPrice !== expectedPrice) {
+                throw new Error(`Wrong price: expected ${expectedPrice}, got ${actualPrice}`);
+              }
+              if (properties.Zulassungsvorgang !== expectedTitle) {
+                throw new Error(`Wrong service property: ${JSON.stringify(properties)}`);
+              }
+              if (properties['Bestellablauf-Version'] !== EXPECTED_VERSION) {
+                throw new Error(`Wrong flow version property: ${JSON.stringify(properties)}`);
+              }
+              if (properties.Unterlagenstatus !== 'Geschützter Upload-Link nach Bestellung erforderlich') {
+                throw new Error(`Wrong document status property: ${JSON.stringify(properties)}`);
+              }
+
+              const result = {
+                service,
+                expectedTitle,
+                finalUrl,
+                liveTheme: before.theme,
+                repairVersion: before.repairVersion,
+                cartStatus: cartResponse.status(),
+                actualVariant,
+                actualPrice,
+                properties,
+                legacyUploadRequests,
+                pageErrors,
+              };
+              fs.writeFileSync('result.json', JSON.stringify(result, null, 2));
+              fs.writeFileSync('cart-response.json', JSON.stringify(parsed, null, 2));
+              await page.screenshot({ path: 'checkout.png', fullPage: false });
+              console.log(`[success] ${JSON.stringify(result)}`);
+            } finally {
+              const postClear = await clearCart(context).catch((error) => ({ error: error.message }));
+              console.log(`[post-clear] ${JSON.stringify(postClear)}`);
+              fs.writeFileSync('post-clear.json', JSON.stringify(postClear, null, 2));
+              await browser.close();
+            }
+          })().catch((error) => {
+            console.error(error.stack || error.message);
+            process.exit(1);
+          });
+          NODE
+
+          node test.js | tee test.log
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-published-${{ matrix.service }}
+          path: /tmp/live-published-${{ matrix.service }}
+          if-no-files-found: error
+          retention-days: 1
