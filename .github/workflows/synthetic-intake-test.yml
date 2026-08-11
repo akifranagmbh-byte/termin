@@ -1,0 +1,91 @@
+name: Synthetic Azure intake test
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/synthetic-intake-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-intake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Test multipart intake contract
+        shell: bash
+        run: |
+          set +e
+          ENDPOINT='https://fn-kfz-zulassung-prod-260810-czaxc8chcze9eufb.germanywestcentral-01.azurewebsites.net/api/precheckout/intake'
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct, zlib
+          w, h = 160, 100
+          raw = b''.join(b'\x00' + b'\xf5\xf5\xf5' * w for _ in range(h))
+          def chunk(kind, data):
+              return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
+          png = b'\x89PNG\r\n\x1a\n'
+          png += chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+          png += chunk(b'IDAT', zlib.compress(raw, 9))
+          png += chunk(b'IEND', b'')
+          Path('/tmp/test-document.png').write_bytes(png)
+
+          bban = '120300000000202051'
+          rearranged = bban + '1314' + '00'
+          check = 98 - (int(rearranged) % 97)
+          Path('/tmp/test-iban.txt').write_text(f'DE{check:02d}{bban}')
+          PY
+
+          post_intake() {
+            label="$1"
+            consent_field="$2"
+            iban=$(cat /tmp/test-iban.txt)
+            rm -f /tmp/intake-body /tmp/intake-headers
+            args=(
+              -X POST "$ENDPOINT"
+              -H 'Origin: https://kennzeichen-krefeld.com'
+              -H 'Accept: application/json'
+              -F 'service=umschreibung'
+              -F 'firstName=TEST'
+              -F 'lastName=TECHNIKTEST'
+              -F 'birthDate=1990-01-01'
+              -F 'street=Teststrasse'
+              -F 'houseNumber=1'
+              -F 'postalCode=47829'
+              -F 'city=Krefeld'
+              -F "iban=${iban}"
+              -F 'registrationCertificatePart1Front=@/tmp/test-document.png;type=image/png'
+              -F 'registrationCertificatePart1Back=@/tmp/test-document.png;type=image/png'
+              -F 'registrationCertificatePart2=@/tmp/test-document.png;type=image/png'
+            )
+            if [ -n "$consent_field" ]; then
+              args+=( -F "${consent_field}=true" )
+            fi
+            code=$(curl --max-time 60 --connect-timeout 15 -sS \
+              -D /tmp/intake-headers -o /tmp/intake-body -w '%{http_code}' \
+              "${args[@]}")
+            rc=$?
+            echo
+            echo "=== ${label} ==="
+            echo "curl_exit=${rc} http_status=${code}"
+            sed -n '1,50p' /tmp/intake-headers 2>/dev/null || true
+            cat /tmp/intake-body 2>/dev/null || true
+            echo
+            grep -Eq '"accepted"[[:space:]]*:[[:space:]]*true' /tmp/intake-body
+          }
+
+          accepted=''
+          if post_intake 'browser payload without named consent' ''; then
+            accepted='browser-payload'
+          else
+            for field in consent privacyConsent dataProcessingConsent privacyAccepted dataProcessingAccepted termsAccepted consentAccepted; do
+              if post_intake "candidate consent field: ${field}" "$field"; then
+                accepted="$field"
+                break
+              fi
+            done
+          fi
+          echo "SYNTHETIC_INTAKE_ACCEPTED_WITH=${accepted:-NONE}"
