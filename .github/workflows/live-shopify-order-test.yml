@@ -1,0 +1,171 @@
+name: Live Shopify order flow test
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/live-shopify-order-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-order-flow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify published theme and rendered order form
+        shell: bash
+        run: |
+          set -euo pipefail
+          STORE='https://kennzeichen-krefeld.com'
+          LIVE_URL="${STORE}/?live-order-test=20260811"
+
+          curl --max-time 60 --connect-timeout 15 -L -sS \
+            -D /tmp/live-headers.txt \
+            -o /tmp/live-static.html \
+            "$LIVE_URL"
+
+          echo '=== PUBLISHED THEME ==='
+          grep -Eo 'Shopify\.theme = \{[^;]+' /tmp/live-static.html | head -1
+          grep -q '"id":192981696778' /tmp/live-static.html
+          grep -q '"role":"main"' /tmp/live-static.html
+          grep -q 'kfz-order-fix.js' /tmp/live-static.html
+
+          BROWSER=''
+          for candidate in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              BROWSER=$(command -v "$candidate")
+              break
+            fi
+          done
+          test -n "$BROWSER"
+
+          "$BROWSER" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-dev-shm-usage \
+            --virtual-time-budget=15000 \
+            --dump-dom \
+            "$LIVE_URL" > /tmp/live-rendered.html
+
+          echo '=== RENDERED REPAIR FORM ==='
+          grep -n 'id="kfz-fixed-order-form"' /tmp/live-rendered.html | head -1
+          grep -q 'Zulassung auswählen. Sicher bezahlen. Unterlagen geschützt nachreichen.' /tmp/live-rendered.html
+          grep -Eq '<form id="df-intake-form"[^>]*hidden' /tmp/live-rendered.html
+
+          for value in neuzulassung umschreibung wiederzulassung adress-namens-aenderung; do
+            grep -q "value=\"${value}\"" /tmp/live-rendered.html
+          done
+
+      - name: Test all four services through cart and checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          STORE='https://kennzeichen-krefeld.com'
+          VERSION='2026-08-11.3-LIVE-TEST'
+
+          test_service() {
+            service="$1"
+            variant="$2"
+            expected_title="$3"
+            expected_price="$4"
+
+            cookie="/tmp/${service}-cookies.txt"
+            add_body="/tmp/${service}-cart-add.json"
+            cart_body="/tmp/${service}-cart.json"
+            checkout_headers="/tmp/${service}-checkout-headers.txt"
+            checkout_body="/tmp/${service}-checkout.html"
+            clear_body="/tmp/${service}-cart-clear.json"
+            rm -f "$cookie" "$add_body" "$cart_body" "$checkout_headers" "$checkout_body" "$clear_body"
+
+            payload=$(python3 - "$variant" "$expected_title" "$VERSION" <<'PY'
+          import json, sys
+          variant, title, version = sys.argv[1:]
+          print(json.dumps({
+              'items': [{
+                  'id': int(variant),
+                  'quantity': 1,
+                  'properties': {
+                      'Zulassungsvorgang': title,
+                      'Unterlagenstatus': 'Sicherer Yousign-Link nach Bestellung erforderlich',
+                      'Bestellablauf-Version': version,
+                  },
+              }],
+          }, ensure_ascii=False))
+          PY
+            )
+
+            add_code=$(curl --max-time 45 --connect-timeout 15 -sS \
+              -c "$cookie" -b "$cookie" \
+              -o "$add_body" -w '%{http_code}' \
+              -X POST "${STORE}/cart/add.js" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json' \
+              --data "$payload")
+            echo "${service}: cart_add_http=${add_code}"
+            test "$add_code" = '200'
+
+            curl --max-time 45 --connect-timeout 15 -sS \
+              -c "$cookie" -b "$cookie" \
+              "${STORE}/cart.js" > "$cart_body"
+
+            python3 - "$cart_body" "$variant" "$expected_title" "$expected_price" "$VERSION" <<'PY'
+          import json, sys
+          path, variant, expected_title, expected_price, version = sys.argv[1:]
+          cart = json.load(open(path, encoding='utf-8'))
+          assert cart['item_count'] == 1, cart
+          item = cart['items'][0]
+          assert item['variant_id'] == int(variant), item
+          assert expected_title in item['title'], item
+          assert item['final_line_price'] == int(expected_price), item
+          assert item['properties']['Zulassungsvorgang'] == expected_title, item
+          assert item['properties']['Unterlagenstatus'] == 'Sicherer Yousign-Link nach Bestellung erforderlich', item
+          assert item['properties']['Bestellablauf-Version'] == version, item
+          print('verified:', item['title'], item['final_line_price'], item['properties'])
+          PY
+
+            checkout_result=$(curl --max-time 60 --connect-timeout 15 -L -sS \
+              -c "$cookie" -b "$cookie" \
+              -D "$checkout_headers" \
+              -o "$checkout_body" \
+              -w '%{http_code} %{url_effective}' \
+              "${STORE}/checkout")
+            echo "${service}: checkout=${checkout_result}"
+            checkout_code=${checkout_result%% *}
+            checkout_url=${checkout_result#* }
+            test "$checkout_code" = '200'
+            echo "$checkout_url" | grep -Eq '/checkout|/checkouts/'
+
+            clear_code=$(curl --max-time 45 --connect-timeout 15 -sS \
+              -c "$cookie" -b "$cookie" \
+              -o "$clear_body" -w '%{http_code}' \
+              -X POST "${STORE}/cart/clear.js" \
+              -H 'Accept: application/json')
+            test "$clear_code" = '200'
+            grep -Eq '"item_count"[[:space:]]*:[[:space:]]*0' "$clear_body"
+          }
+
+          test_service neuzulassung 51237294539018 'Neuzulassung' 12000
+          test_service umschreibung 53495252254986 'Umschreibung' 12000
+          test_service wiederzulassung 53495253041418 'Wiederzulassung' 12000
+          test_service adress-namens-aenderung 53495252910346 'Adress- oder Namensänderung' 4900
+
+      - name: Upload live-test evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-shopify-order-test-20260811
+          path: |
+            /tmp/live-headers.txt
+            /tmp/live-static.html
+            /tmp/live-rendered.html
+            /tmp/*-cart-add.json
+            /tmp/*-cart.json
+            /tmp/*-checkout-headers.txt
+            /tmp/*-checkout.html
+            /tmp/*-cart-clear.json
+          if-no-files-found: error
+          retention-days: 1
+
+# Pull-request trigger for the live verification run.
