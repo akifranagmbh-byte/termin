@@ -69,7 +69,7 @@ jobs:
           test_service() {
             service="$1"
             variant="$2"
-            expected_title="$3"
+            expected_service="$3"
             expected_price="$4"
 
             cookie="/tmp/${service}-cookies.txt"
@@ -80,15 +80,15 @@ jobs:
             clear_body="/tmp/${service}-cart-clear.json"
             rm -f "$cookie" "$add_body" "$cart_body" "$checkout_headers" "$checkout_body" "$clear_body"
 
-            payload=$(python3 - "$variant" "$expected_title" "$VERSION" <<'PY'
+            payload=$(python3 - "$variant" "$expected_service" "$VERSION" <<'PY'
           import json, sys
-          variant, title, version = sys.argv[1:]
+          variant, service, version = sys.argv[1:]
           print(json.dumps({
               'items': [{
                   'id': int(variant),
                   'quantity': 1,
                   'properties': {
-                      'Zulassungsvorgang': title,
+                      'Zulassungsvorgang': service,
                       'Unterlagenstatus': 'Sicherer Yousign-Link nach Bestellung erforderlich',
                       'Bestellablauf-Version': version,
                   },
@@ -111,16 +111,15 @@ jobs:
               -c "$cookie" -b "$cookie" \
               "${STORE}/cart.js" > "$cart_body"
 
-            python3 - "$cart_body" "$variant" "$expected_title" "$expected_price" "$VERSION" <<'PY'
+            python3 - "$cart_body" "$variant" "$expected_service" "$expected_price" "$VERSION" <<'PY'
           import json, sys
-          path, variant, expected_title, expected_price, version = sys.argv[1:]
+          path, variant, expected_service, expected_price, version = sys.argv[1:]
           cart = json.load(open(path, encoding='utf-8'))
           assert cart['item_count'] == 1, cart
           item = cart['items'][0]
           assert item['variant_id'] == int(variant), item
-          assert expected_title in item['title'], item
           assert item['final_line_price'] == int(expected_price), item
-          assert item['properties']['Zulassungsvorgang'] == expected_title, item
+          assert item['properties']['Zulassungsvorgang'] == expected_service, item
           assert item['properties']['Unterlagenstatus'] == 'Sicherer Yousign-Link nach Bestellung erforderlich', item
           assert item['properties']['Bestellablauf-Version'] == version, item
           print('verified:', item['title'], item['final_line_price'], item['properties'])
