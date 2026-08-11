@@ -77,3 +77,59 @@ jobs:
             -H 'Accept: application/json' \
             -H 'Content-Type: application/json' \
             --data '{}'
+
+      - name: Fetch and inspect live storefront HTML
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --max-time 60 --connect-timeout 15 -L -sS \
+            -D /tmp/kennzeichen-home-headers.txt \
+            -o /tmp/kennzeichen-home-live.html \
+            'https://kennzeichen-krefeld.com/?diagnose=20260811'
+
+          echo '=== LIVE HOME RESPONSE ==='
+          sed -n '1,80p' /tmp/kennzeichen-home-headers.txt
+          wc -c /tmp/kennzeichen-home-live.html
+          sha256sum /tmp/kennzeichen-home-live.html
+
+          echo '=== FORM / ENDPOINT MARKERS ==='
+          grep -Eo 'secure-ikfz-form|df-intake-form|fn-[A-Za-z0-9.-]+azurewebsites\.net[^"'"'"' <]*|/api/[A-Za-z0-9/_-]+' /tmp/kennzeichen-home-live.html | sort -u || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          html = Path('/tmp/kennzeichen-home-live.html').read_text(encoding='utf-8', errors='replace')
+          needles = [
+              'secure-ikfz-form',
+              'df-intake-form',
+              'fn-kennzeichen-umwelt-prod',
+              'fn-kfz-zulassung-prod',
+              '/cart/add.js',
+              "window.location.assign('/checkout')",
+          ]
+          for needle in needles:
+              print(f'\n=== CONTEXT: {needle} ===')
+              start = 0
+              found = False
+              while True:
+                  index = html.find(needle, start)
+                  if index < 0:
+                      break
+                  found = True
+                  left = max(0, index - 650)
+                  right = min(len(html), index + 1650)
+                  print(html[left:right])
+                  print('\n---')
+                  start = index + len(needle)
+              if not found:
+                  print('NOT FOUND')
+          PY
+
+      - name: Upload live storefront snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-storefront-20260811
+          path: |
+            /tmp/kennzeichen-home-live.html
+            /tmp/kennzeichen-home-headers.txt
+          if-no-files-found: error
+          retention-days: 1
