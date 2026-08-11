@@ -10,16 +10,44 @@ permissions:
   contents: read
 
 jobs:
-  verify-preview:
+  verify-service:
+    name: ${{ matrix.title }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - service: neuzulassung
+            variant: 51237294539018
+            price: 12000
+            title: Neuzulassung
+          - service: umschreibung
+            variant: 53495252254986
+            price: 12000
+            title: Umschreibung
+          - service: wiederzulassung
+            variant: 53495253041418
+            price: 12000
+            title: Wiederzulassung
+          - service: adress-namens-aenderung
+            variant: 53495252910346
+            price: 4900
+            title: Adress- oder Namensänderung
     steps:
-      - name: Test all four services in real Chrome sessions
+      - name: Test one service in a clean real-Chrome session
         shell: bash
+        env:
+          SERVICE: ${{ matrix.service }}
+          VARIANT_ID: ${{ matrix.variant }}
+          EXPECTED_PRICE: ${{ matrix.price }}
+          EXPECTED_TITLE: ${{ matrix.title }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/kfz-preview-test
-          cd /tmp/kfz-preview-test
+          WORK="/tmp/kfz-preview-${SERVICE}"
+          mkdir -p "$WORK"
+          cd "$WORK"
           npm init -y >/dev/null 2>&1
           npm install puppeteer-core@24.16.0 --no-audit --no-fund >/dev/null
 
@@ -30,12 +58,10 @@ jobs:
           const STORE = 'https://kennzeichen-krefeld.com';
           const THEME_ID = 192982286602;
           const VERSION = '2026-08-11.4';
-          const services = [
-            ['neuzulassung', 51237294539018, 12000, 'Neuzulassung'],
-            ['umschreibung', 53495252254986, 12000, 'Umschreibung'],
-            ['wiederzulassung', 53495253041418, 12000, 'Wiederzulassung'],
-            ['adress-namens-aenderung', 53495252910346, 4900, 'Adress- oder Namensänderung'],
-          ];
+          const service = process.env.SERVICE;
+          const variantId = Number(process.env.VARIANT_ID);
+          const expectedPrice = Number(process.env.EXPECTED_PRICE);
+          const expectedTitle = process.env.EXPECTED_TITLE;
           const candidates = [
             '/usr/bin/google-chrome-stable',
             '/usr/bin/google-chrome',
@@ -47,14 +73,23 @@ jobs:
 
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-          async function testService(browser, service, variantId, expectedPrice, expectedTitle) {
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath,
+              headless: true,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-first-run',
+                '--no-default-browser-check',
+              ],
+            });
+
             const context = await browser.createBrowserContext();
             const page = await context.newPage();
             await page.setViewport({ width: 1440, height: 1100, deviceScaleFactor: 1 });
-            await page.setExtraHTTPHeaders({
-              'Cache-Control': 'no-cache, no-store, max-age=0',
-              Pragma: 'no-cache',
-            });
 
             const azureRequests = [];
             let cartResponse = null;
@@ -66,90 +101,101 @@ jobs:
               let body = '';
               try { body = await response.text(); } catch (_) {}
               cartResponse = { status: response.status(), body };
+              console.log(`[cart-add] status=${response.status()} body=${body.slice(0, 1000)}`);
             });
-            page.on('pageerror', (error) => console.log(`[${service}:pageerror] ${error.stack || error.message}`));
-            page.on('console', (message) => {
-              if (message.type() === 'error' || message.type() === 'warning') {
-                console.log(`[${service}:console:${message.type()}] ${message.text()}`);
-              }
+            page.on('pageerror', (error) => {
+              const text = String(error.stack || error.message || error);
+              if (text.includes('azurewebsites.net')) console.log(`[pageerror] ${text}`);
             });
 
-            const previewUrl = `${STORE}/?preview_theme_id=${THEME_ID}&service-test=${service}-${Date.now()}`;
-            await page.goto(previewUrl, { waitUntil: 'networkidle2', timeout: 90000 });
-            await page.waitForSelector('#kfz-fixed-order-form', { visible: true, timeout: 30000 });
-            await sleep(1000);
-
-            const state = await page.evaluate(() => {
-              const fixed = document.querySelector('#kfz-fixed-order-form');
-              const rect = fixed ? fixed.getBoundingClientRect() : null;
-              return {
-                theme: window.Shopify?.theme || null,
-                repairVersion: document.documentElement.getAttribute('data-kfz-order-fix'),
-                fixedExists: Boolean(fixed),
-                fixedVisible: Boolean(rect && rect.width > 0 && rect.height > 0),
-                legacyExists: Boolean(document.querySelector('#df-intake-form')),
-                prepExists: Boolean(document.querySelector('#secure-ikfz .df-prep')),
-                visibleText: document.querySelector('#secure-ikfz')?.innerText || '',
-              };
-            });
-            console.log(`[${service}:state] ${JSON.stringify(state)}`);
-            if (Number(state.theme?.id) !== THEME_ID) throw new Error(`${service}: wrong preview theme`);
-            if (state.repairVersion !== VERSION) throw new Error(`${service}: wrong repair version`);
-            if (!state.fixedExists || !state.fixedVisible) throw new Error(`${service}: repaired form not visible`);
-            if (state.legacyExists || state.prepExists) throw new Error(`${service}: legacy upload still present`);
-            if (/sichere übermittlung ist gerade nicht möglich/i.test(state.visibleText)) {
-              throw new Error(`${service}: old failure message is still visible`);
-            }
-
-            await page.select('#kfz-fixed-order-form select[name="service"]', service);
-            await page.click('#kfz-fixed-order-form input[name="privacyAccepted"]');
-            await Promise.all([
-              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
-              page.click('#kfz-fixed-order-form button[type="submit"]'),
-            ]);
-
-            const checkoutUrl = page.url();
-            console.log(`[${service}:checkout] ${checkoutUrl}`);
-            if (!/\/checkouts?\//.test(checkoutUrl) && !checkoutUrl.includes('/checkout')) {
-              throw new Error(`${service}: checkout not reached`);
-            }
-            if (azureRequests.length !== 0) throw new Error(`${service}: legacy Azure endpoint was called`);
-            if (!cartResponse || cartResponse.status !== 200) throw new Error(`${service}: cart add failed`);
-
-            const parsed = JSON.parse(cartResponse.body);
-            const item = Array.isArray(parsed.items) ? parsed.items[0] : parsed;
-            if (Number(item.variant_id || item.id) !== variantId) throw new Error(`${service}: wrong variant`);
-            if (Number(item.final_line_price || item.line_price || item.price) !== expectedPrice) {
-              throw new Error(`${service}: wrong price`);
-            }
-            if (item.properties?.Zulassungsvorgang !== expectedTitle) throw new Error(`${service}: wrong title property`);
-            if (item.properties?.['Bestellablauf-Version'] !== VERSION) throw new Error(`${service}: wrong flow version`);
-
-            const clearPage = await context.newPage();
-            await clearPage.goto(`${STORE}/cart?clear=${Date.now()}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            const cleared = await clearPage.evaluate(async () => {
-              const response = await fetch('/cart/clear.js', {
-                method: 'POST',
-                credentials: 'same-origin',
-                headers: { Accept: 'application/json' },
-              });
-              return { status: response.status, data: await response.json() };
-            });
-            if (cleared.status !== 200 || cleared.data.item_count !== 0) throw new Error(`${service}: cart not cleared`);
-            await page.screenshot({ path: `/tmp/kfz-preview-test/${service}.png`, fullPage: false });
-            await context.close();
-            console.log(`[${service}:success] variant=${variantId} price=${expectedPrice}`);
-          }
-
-          (async () => {
-            const browser = await puppeteer.launch({
-              executablePath,
-              headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-            });
             try {
-              for (const service of services) await testService(browser, ...service);
+              const previewUrl = `${STORE}/?preview_theme_id=${THEME_ID}&service-test=${service}-${Date.now()}`;
+              await page.goto(previewUrl, { waitUntil: 'networkidle2', timeout: 90000 });
+              await page.waitForSelector('#kfz-fixed-order-form', { visible: true, timeout: 30000 });
+              await sleep(1200);
+
+              const state = await page.evaluate(() => {
+                const fixed = document.querySelector('#kfz-fixed-order-form');
+                const rect = fixed ? fixed.getBoundingClientRect() : null;
+                const text = document.querySelector('#secure-ikfz')?.innerText || '';
+                return {
+                  theme: window.Shopify?.theme || null,
+                  repairVersion: document.documentElement.getAttribute('data-kfz-order-fix'),
+                  fixedExists: Boolean(fixed),
+                  fixedVisible: Boolean(rect && rect.width > 0 && rect.height > 0),
+                  legacyExists: Boolean(document.querySelector('#df-intake-form')),
+                  prepExists: Boolean(document.querySelector('#secure-ikfz .df-prep')),
+                  oldFailureVisible: /sichere übermittlung ist gerade nicht möglich/i.test(text),
+                  heading: document.querySelector('#secure-ikfz h2')?.textContent?.trim() || '',
+                };
+              });
+              console.log(`[state] ${JSON.stringify(state)}`);
+              fs.writeFileSync('state.json', JSON.stringify(state, null, 2));
+              await page.screenshot({ path: 'before-submit.png', fullPage: false });
+
+              if (Number(state.theme?.id) !== THEME_ID) throw new Error('Wrong preview theme.');
+              if (state.repairVersion !== VERSION) throw new Error('Wrong repair version.');
+              if (!state.fixedExists || !state.fixedVisible) throw new Error('Repaired form is not visible.');
+              if (state.legacyExists || state.prepExists) throw new Error('Legacy Azure upload is still present.');
+              if (state.oldFailureVisible) throw new Error('Old secure-transmission failure is still visible.');
+
+              await page.select('#kfz-fixed-order-form select[name="service"]', service);
+              await page.click('#kfz-fixed-order-form input[name="privacyAccepted"]');
+
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+                page.click('#kfz-fixed-order-form button[type="submit"]'),
+              ]);
+
+              const checkoutUrl = page.url();
+              console.log(`[checkout] ${checkoutUrl}`);
+              if (!/\/checkouts?\//.test(checkoutUrl) && !checkoutUrl.includes('/checkout')) {
+                throw new Error(`Checkout not reached: ${checkoutUrl}`);
+              }
+              if (azureRequests.length !== 0) {
+                throw new Error(`Legacy Azure endpoint was called: ${JSON.stringify(azureRequests)}`);
+              }
+              if (!cartResponse || cartResponse.status !== 200) {
+                throw new Error(`Cart add did not return 200: ${JSON.stringify(cartResponse)}`);
+              }
+
+              const parsed = JSON.parse(cartResponse.body);
+              const item = Array.isArray(parsed.items) ? parsed.items[0] : parsed;
+              const actualVariant = Number(item.variant_id || item.id);
+              const actualPrice = Number(item.final_line_price || item.line_price || item.price);
+              if (actualVariant !== variantId) throw new Error(`Wrong variant: ${actualVariant}`);
+              if (actualPrice !== expectedPrice) throw new Error(`Wrong price: ${actualPrice}`);
+              if (item.properties?.Zulassungsvorgang !== expectedTitle) {
+                throw new Error(`Wrong service property: ${JSON.stringify(item.properties)}`);
+              }
+              if (item.properties?.['Bestellablauf-Version'] !== VERSION) {
+                throw new Error(`Wrong flow version: ${JSON.stringify(item.properties)}`);
+              }
+              if (item.properties?.Unterlagenstatus !== 'Geschützter Upload-Link nach Bestellung erforderlich') {
+                throw new Error(`Wrong document status: ${JSON.stringify(item.properties)}`);
+              }
+
+              fs.writeFileSync('cart-response.json', JSON.stringify(parsed, null, 2));
+              console.log(`[success] service=${service} variant=${actualVariant} price=${actualPrice}`);
             } finally {
+              const clearPage = await context.newPage();
+              try {
+                await clearPage.goto(`${STORE}/cart?clear=${Date.now()}`, {
+                  waitUntil: 'domcontentloaded',
+                  timeout: 60000,
+                });
+                const cleared = await clearPage.evaluate(async () => {
+                  const response = await fetch('/cart/clear.js', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { Accept: 'application/json' },
+                  });
+                  return { status: response.status, text: await response.text() };
+                });
+                console.log(`[cart-clear] ${JSON.stringify(cleared)}`);
+              } catch (error) {
+                console.log(`[cart-clear-error] ${error.message}`);
+              }
               await browser.close();
             }
           })().catch((error) => {
@@ -158,13 +204,13 @@ jobs:
           });
           NODE
 
-          node test.js | tee /tmp/kfz-preview-test/test.log
+          node test.js | tee test.log
 
-      - name: Upload test evidence
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: repaired-shopify-preview-evidence
-          path: /tmp/kfz-preview-test
+          name: repaired-preview-${{ matrix.service }}
+          path: /tmp/kfz-preview-${{ matrix.service }}
           if-no-files-found: error
           retention-days: 1
