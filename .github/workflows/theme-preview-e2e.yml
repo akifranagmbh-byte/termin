@@ -1,0 +1,119 @@
+name: Test repaired Shopify theme preview
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/theme-preview-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preview-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - name: Fetch repaired theme preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREVIEW='https://kennzeichen-krefeld.com/?preview_theme_id=192981696778&_fd=0&pb=0&test=20260811'
+          curl --max-time 60 --connect-timeout 15 -L -sS \
+            -c /tmp/preview-cookies -b /tmp/preview-cookies \
+            -D /tmp/preview-headers.txt \
+            -o /tmp/preview-static.html \
+            "$PREVIEW"
+
+          echo '=== PREVIEW HEADERS ==='
+          sed -n '1,80p' /tmp/preview-headers.txt
+          echo '=== PREVIEW SIZE / HASH ==='
+          wc -c /tmp/preview-static.html
+          sha256sum /tmp/preview-static.html
+          echo '=== REPAIR ASSET MARKER ==='
+          grep -n 'kfz-order-fix.js' /tmp/preview-static.html | head -5
+          echo '=== PREVIEW THEME MARKER ==='
+          grep -Eo 'Shopify\.theme = \{[^;]+' /tmp/preview-static.html | head -1 || true
+
+      - name: Render repaired form in headless Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREVIEW='https://kennzeichen-krefeld.com/?preview_theme_id=192981696778&_fd=0&pb=0&test=20260811'
+          BROWSER=''
+          for candidate in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              BROWSER=$(command -v "$candidate")
+              break
+            fi
+          done
+          test -n "$BROWSER"
+          echo "browser=$BROWSER"
+          "$BROWSER" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-dev-shm-usage \
+            --virtual-time-budget=12000 \
+            --dump-dom \
+            "$PREVIEW" > /tmp/preview-rendered.html
+
+          echo '=== RENDERED FORM MARKERS ==='
+          grep -n 'id="kfz-fixed-order-form"' /tmp/preview-rendered.html | head -3
+          grep -n 'Zulassung auswählen. Sicher bezahlen.' /tmp/preview-rendered.html | head -3
+          grep -n 'Sicherer Yousign-Link nach Bestellung erforderlich' /tmp/preview-rendered.html | head -3 || true
+          echo '=== BROKEN FORM STATE ==='
+          grep -Eo '<form id="df-intake-form"[^>]*>' /tmp/preview-rendered.html | head -1 || true
+
+      - name: Verify Shopify cart API and clear test cart
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /tmp/cart-cookies /tmp/cart-add.json /tmp/cart.json
+
+          code=$(curl --max-time 45 --connect-timeout 15 -sS \
+            -c /tmp/cart-cookies -b /tmp/cart-cookies \
+            -o /tmp/cart-add.json -w '%{http_code}' \
+            -X POST 'https://kennzeichen-krefeld.com/cart/add.js' \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' \
+            --data '{"items":[{"id":53495252910346,"quantity":1,"properties":{"Zulassungsvorgang":"Adress- oder Namensänderung – automatischer Techniktest","Unterlagenstatus":"Sicherer Yousign-Link nach Bestellung erforderlich","Bestellablauf-Version":"2026-08-11.3-TEST"}}]}')
+          echo "cart_add_http=$code"
+          test "$code" = '200'
+          grep -q '53495252910346' /tmp/cart-add.json
+
+          curl --max-time 45 --connect-timeout 15 -sS \
+            -c /tmp/cart-cookies -b /tmp/cart-cookies \
+            'https://kennzeichen-krefeld.com/cart.js' > /tmp/cart.json
+          python3 - <<'PY'
+          import json
+          cart = json.load(open('/tmp/cart.json', encoding='utf-8'))
+          assert cart['item_count'] == 1, cart
+          item = cart['items'][0]
+          assert item['variant_id'] == 53495252910346, item
+          assert item['properties']['Bestellablauf-Version'] == '2026-08-11.3-TEST', item
+          print('cart_verified=', item['title'], item['final_line_price'])
+          PY
+
+          clear_code=$(curl --max-time 45 --connect-timeout 15 -sS \
+            -c /tmp/cart-cookies -b /tmp/cart-cookies \
+            -o /tmp/cart-clear.json -w '%{http_code}' \
+            -X POST 'https://kennzeichen-krefeld.com/cart/clear.js' \
+            -H 'Accept: application/json')
+          echo "cart_clear_http=$clear_code"
+          test "$clear_code" = '200'
+          grep -Eq '"item_count"[[:space:]]*:[[:space:]]*0' /tmp/cart-clear.json
+
+      - name: Upload preview evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: repaired-theme-preview-20260811
+          path: |
+            /tmp/preview-headers.txt
+            /tmp/preview-static.html
+            /tmp/preview-rendered.html
+            /tmp/cart-add.json
+            /tmp/cart.json
+            /tmp/cart-clear.json
+          if-no-files-found: error
+          retention-days: 1
